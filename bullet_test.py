@@ -1,0 +1,145 @@
+import pybullet as p
+import pybullet_data
+import time
+import random
+import os
+import cv2
+import inspect
+import numpy as np
+
+current_dir = os.path.dirname(os.path.abspath(inspect.getfile(inspect.currentframe())))
+assets_dir = os.path.join(current_dir, "assets_new")
+
+#image folder
+save_path = os.path.join(current_dir, "captured_images")
+if not os.path.exists(save_path):
+    os.makedirs(save_path)
+
+# --- PyBullet setup ---
+cid = p.connect(p.GUI, options="--disable-example-browser")
+p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0) 
+p.configureDebugVisualizer(p.COV_ENABLE_SHADOWS, 1) 
+
+p.setGravity(0, 0, -9.8)
+data_path = pybullet_data.getDataPath()
+p.setAdditionalSearchPath(assets_dir) 
+
+plane_id = p.loadURDF(os.path.join(data_path, "plane.urdf"))
+p.changeVisualShape(plane_id, -1, rgbaColor=[0.2, 0.5, 0.2, 1])
+
+# camera variables
+cam_height = 30.0      
+cam_target = [0, 0, 0] 
+base_eye_pos = [20, 20, cam_height]
+baseline = 2.0 #2 unit differance
+
+def get_camera_image(offset_x=0):
+    """Captures an image with an optional horizontal offset."""
+    view_matrix = p.computeViewMatrix(
+        cameraEyePosition=[base_eye_pos[0] + offset_x, base_eye_pos[1], base_eye_pos[2]], 
+        cameraTargetPosition=cam_target,
+        cameraUpVector=[0, 0, 1]
+    )
+    proj_matrix = p.computeProjectionMatrixFOV(
+        fov=60, aspect=1.0, nearVal=0.1, farVal=100.0
+    )
+    
+    width, height = 640, 640 #resolution 
+    (_, _, px, _, _) = p.getCameraImage(
+        width=width, height=height, 
+        viewMatrix=view_matrix,
+        projectionMatrix=proj_matrix,
+        renderer=p.ER_BULLET_HARDWARE_OPENGL
+    )
+    
+    rgb_array = np.reshape(np.array(px, dtype=np.uint8), (height, width, 4))
+    return cv2.cvtColor(rgb_array[:, :, :3], cv2.COLOR_RGB2BGR)
+
+# Object creating
+def create_fire_sphere(position=[0, 0, 5], radius=1.5):
+    visual_id = p.createVisualShape(shapeType=p.GEOM_SPHERE, radius=radius, rgbaColor=[1, 0, 0, 1])
+    return p.createMultiBody(baseMass=0, baseVisualShapeIndex=visual_id, basePosition=position)
+
+def create_sphere_grid(start_pos, rows, cols, radius=1.5):
+    spacing = radius * 2 
+    for i in range(rows):
+        for j in range(cols):
+            create_fire_sphere(position=[start_pos[0] + i*spacing, start_pos[1] + j*spacing, start_pos[2]], radius=radius)
+
+def load_custom_object(urdf_filename, position=[0, 0, 0], orientation=[0, 0, 0, 1]):
+    try:
+        return p.loadURDF(urdf_filename, basePosition=position, baseOrientation=orientation, useFixedBase=True)
+    except:
+        return None
+
+# --- random positioning ---
+area_size = 80  
+placed_positions = []
+
+def place_randomly(urdf_list, count, min_dist):
+    placed = 0
+    attempts = 0
+    while placed < count and attempts < 1000:
+        pos = [random.uniform(-area_size, area_size), random.uniform(-area_size, area_size), 0]
+        if all(np.linalg.norm(np.array(pos) - np.array(p_pos)) > min_dist for p_pos in placed_positions):
+            path = random.choice(urdf_list)
+            rot = p.getQuaternionFromEuler([0, 0, random.uniform(0, 6.28)])
+            load_custom_object(path, position=pos, orientation=rot)
+            placed_positions.append(pos)
+            placed += 1
+        attempts += 1
+
+#putting trees,rocks,bushes and fire
+place_randomly(["pinusbruita/pinusbruita.urdf", "oak/oak.urdf", "tree/tree.urdf"], 80, 5.0)
+create_sphere_grid(start_pos=[-10, -10, 2], rows=4, cols=3)
+create_sphere_grid(start_pos=[10, 10, 2], rows=2, cols=3)
+place_randomly(["smallrock/smallrock.urdf", "mediumrock/mediumrock.urdf", "bigrock/bigrock.urdf"], 80, 3.0)
+place_randomly(["bush/bush.urdf"], 90, 2.5)
+
+# camera settings
+p.resetDebugVisualizerCamera(cameraDistance=40, cameraYaw=45, cameraPitch=-35, cameraTargetPosition=cam_target)
+
+# --- Main Loop ---
+img_counter = 0
+print("------ Controls -----")
+print("Press 's' to capture images.")
+print("Press 'q' to quit.")
+
+while True:
+    p.stepSimulation()
+    
+    #for saving images or closing
+    keys = p.getKeyboardEvents()
+    
+    #both camera captures images
+    img_left = get_camera_image(offset_x=0)
+    img_right = get_camera_image(offset_x=baseline)
+    
+    cv2.imshow("Left Eye (Reference)", img_left)
+    cv2.imshow("Right Eye (Shifted)", img_right)
+
+    # input check for 's' key 
+    if ord('s') in keys and keys[ord('s')] & p.KEY_WAS_TRIGGERED:
+        l_filename = os.path.join(save_path, f"rect_l_{img_counter}.png")
+        r_filename = os.path.join(save_path, f"rect_r_{img_counter}.png")
+        
+        cv2.imwrite(l_filename, img_left)
+        cv2.imwrite(r_filename, img_right)
+        
+        print(f"!!! SUCCESS !!! Saved pair {img_counter}")
+        print(f"Path: {l_filename}")
+        
+        # feedback about image
+        cv2.setWindowTitle("Left Eye (Reference)", "SAVED! - SAVED! - SAVED!")
+        img_counter += 1
+    else:
+        cv2.setWindowTitle("Left Eye (Reference)", "Left Eye (Reference)")
+
+    # 4. Check for 'Q' or OpenCV quit
+    if (ord('q') in keys) or (cv2.waitKey(1) & 0xFF == ord('q')):
+        break
+        
+    time.sleep(1/240)
+
+p.disconnect()
+cv2.destroyAllWindows()

@@ -1,0 +1,23 @@
+<?xml version="1.0" ?>
+<robot name="bigrock">
+  <link name="baseLink">
+
+    <visual>
+      <origin rpy="0 0 0" xyz="0 0 0.0"/> 
+      <geometry>
+        <mesh filename="bigrock.obj" scale="1 1 1"/>
+      </geometry>
+      <material name="gray">
+        <color rgba="0.753 0.753 0.753 1.0"/>
+      </material>
+    </visual>
+    
+    <collision>
+      <origin rpy="0 0 0" xyz="0 0 0.0"/> 
+      <geometry>
+        <mesh filename="bigrock.obj" scale="1 1 1"/>
+        
+        </geometry>
+    </collision>
+  </link>
+</robot>
