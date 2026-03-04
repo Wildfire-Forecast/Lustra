@@ -28,30 +28,47 @@ plane_id = p.loadURDF(os.path.join(data_path, "plane.urdf"))
 p.changeVisualShape(plane_id, -1, rgbaColor=[0.2, 0.5, 0.2, 1])
 
 # camera variables
-cam_height = 30.0      
-cam_target = [0, 0, 0] 
-base_eye_pos = [20, 20, cam_height]
-baseline = 2.0 #2 unit differance
+cam_height = 30.0
+width, height = 640, 640
+fov = 60
+nearVal, farVal = 0.1, 100.0
 
-def get_camera_image(offset_x=0):
-    """Captures an image with an optional horizontal offset."""
+cam_up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+cam_target = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+base_eye_pos = np.array([20.0, 20.0, cam_height], dtype=np.float32)
+
+baseline_m = 0.06  # meters, assuming 1 bullet unit = 1 meter
+
+def _normalize(v):
+    n = np.linalg.norm(v)
+    if n < 1e-9:
+        return v
+    return v / n
+
+def get_stereo_eyes():
+    forward = _normalize(cam_target - base_eye_pos)   # camera forward direction
+    right = _normalize(np.cross(forward, cam_up))     # camera right direction
+    left_eye = base_eye_pos - right * (baseline_m / 2.0)
+    right_eye = base_eye_pos + right * (baseline_m / 2.0)
+    return left_eye, right_eye
+
+def get_camera_image(eye_pos):
     view_matrix = p.computeViewMatrix(
-        cameraEyePosition=[base_eye_pos[0] + offset_x, base_eye_pos[1], base_eye_pos[2]], 
-        cameraTargetPosition=cam_target,
-        cameraUpVector=[0, 0, 1]
+        cameraEyePosition=eye_pos.tolist(),
+        cameraTargetPosition=cam_target.tolist(),
+        cameraUpVector=cam_up.tolist()
     )
     proj_matrix = p.computeProjectionMatrixFOV(
-        fov=60, aspect=1.0, nearVal=0.1, farVal=100.0
+        fov=fov, aspect=float(width)/float(height), nearVal=nearVal, farVal=farVal
     )
-    
-    width, height = 640, 640 #resolution 
+
     (_, _, px, _, _) = p.getCameraImage(
-        width=width, height=height, 
+        width=width, height=height,
         viewMatrix=view_matrix,
         projectionMatrix=proj_matrix,
         renderer=p.ER_BULLET_HARDWARE_OPENGL
     )
-    
+
     rgb_array = np.reshape(np.array(px, dtype=np.uint8), (height, width, 4))
     return cv2.cvtColor(rgb_array[:, :, :3], cv2.COLOR_RGB2BGR)
 
@@ -97,7 +114,9 @@ place_randomly(["smallrock/smallrock.urdf", "mediumrock/mediumrock.urdf", "bigro
 place_randomly(["bush/bush.urdf"], 90, 2.5)
 
 # camera settings
-p.resetDebugVisualizerCamera(cameraDistance=40, cameraYaw=45, cameraPitch=-35, cameraTargetPosition=cam_target)
+p.resetDebugVisualizerCamera(
+    cameraDistance=40, cameraYaw=45, cameraPitch=-35, cameraTargetPosition=cam_target.tolist()
+)
 
 # --- Main Loop ---
 img_counter = 0
@@ -112,8 +131,9 @@ while True:
     keys = p.getKeyboardEvents()
     
     #both camera captures images
-    img_left = get_camera_image(offset_x=0)
-    img_right = get_camera_image(offset_x=baseline)
+    left_eye, right_eye = get_stereo_eyes()
+    img_left  = get_camera_image(left_eye)
+    img_right = get_camera_image(right_eye)
     
     cv2.imshow("Left Eye (Reference)", img_left)
     cv2.imshow("Right Eye (Shifted)", img_right)
