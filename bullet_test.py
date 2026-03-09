@@ -85,8 +85,21 @@ def create_sphere_grid(start_pos, rows, cols, radius=1.5):
 
 def load_custom_object(urdf_filename, position=[0, 0, 0], orientation=[0, 0, 0, 1]):
     try:
-        return p.loadURDF(urdf_filename, basePosition=position, baseOrientation=orientation, useFixedBase=True)
-    except:
+        obj_id = p.loadURDF(urdf_filename, basePosition=position, 
+                            baseOrientation=orientation, useFixedBase=True)
+        
+        #custom texture for leaves
+        obj_folder = os.path.dirname(urdf_filename)
+        tex_path = os.path.join(assets_dir, obj_folder, "leaf_pattern.png")
+
+        if os.path.exists(tex_path):
+            tex_id = p.loadTexture(tex_path)
+            
+            p.changeVisualShape(obj_id, 0, textureUniqueId=tex_id, rgbaColor=[1, 1, 1, 1])
+            
+        return obj_id
+    except Exception as e:
+        print(f"Error loading {urdf_filename}: {e}")
         return None
 
 # --- random positioning ---
@@ -113,6 +126,7 @@ create_sphere_grid(start_pos=[10, 10, 2], rows=2, cols=3)
 place_randomly(["smallrock/smallrock.urdf", "mediumrock/mediumrock.urdf", "bigrock/bigrock.urdf"], 80, 3.0)
 place_randomly(["bush/bush.urdf"], 90, 2.5)
 
+
 # camera settings
 p.resetDebugVisualizerCamera(
     cameraDistance=40, cameraYaw=45, cameraPitch=-35, cameraTargetPosition=cam_target.tolist()
@@ -121,7 +135,8 @@ p.resetDebugVisualizerCamera(
 # --- Main Loop ---
 img_counter = 0
 print("------ Controls -----")
-print("Press 's' to capture images.")
+print("Press 's' to toggle shaders.")
+print("Press 't' to capture images.")
 print("Press 'q' to quit.")
 
 while True:
@@ -139,7 +154,7 @@ while True:
     cv2.imshow("Right Eye (Shifted)", img_right)
 
     # input check for 's' key 
-    if ord('s') in keys and keys[ord('s')] & p.KEY_WAS_TRIGGERED:
+    if ord('t') in keys and keys[ord('t')] & p.KEY_WAS_TRIGGERED:
         l_filename = os.path.join(save_path, f"rect_l_{img_counter}.png")
         r_filename = os.path.join(save_path, f"rect_r_{img_counter}.png")
         
