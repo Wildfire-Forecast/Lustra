@@ -83,6 +83,7 @@ def create_sphere_grid(start_pos, rows, cols, radius=1.5):
         for j in range(cols):
             create_fire_sphere(position=[start_pos[0] + i*spacing, start_pos[1] + j*spacing, start_pos[2]], radius=radius)
 
+#creating objects from blender
 def load_custom_object(urdf_filename, position=[0, 0, 0], orientation=[0, 0, 0, 1]):
     try:
         obj_id = p.loadURDF(urdf_filename, basePosition=position, 
@@ -132,18 +133,48 @@ p.resetDebugVisualizerCamera(
     cameraDistance=40, cameraYaw=45, cameraPitch=-35, cameraTargetPosition=cam_target.tolist()
 )
 
-# --- Main Loop ---
+move_speed = 0.5
 img_counter = 0
+
+# controls
+print("------ Drone Controls -----")
+print("Press 'w' to move forwards.")
+print("Press 'x' to move backwards.")
+print("Press 'a' to move left.")
+print("Press 'd' to move right.")
+print("Press 'r' to move up.")
+print("Press 'f' to move down.")
 print("------ Controls -----")
 print("Press 's' to toggle shaders.")
 print("Press 't' to capture images.")
 print("Press 'q' to quit.")
 
+# --- Main Loop ---
 while True:
     p.stepSimulation()
-    
-    #for saving images or closing
     keys = p.getKeyboardEvents()
+
+    forward = _normalize(cam_target - base_eye_pos)
+    right = _normalize(np.cross(forward, cam_up))
+
+    if ord('w') in keys and keys[ord('w')] & p.KEY_IS_DOWN:
+        base_eye_pos += forward * move_speed
+        cam_target += forward * move_speed
+    if ord('x') in keys and keys[ord('x')] & p.KEY_IS_DOWN:
+        base_eye_pos -= forward * move_speed
+        cam_target -= forward * move_speed
+    if ord('a') in keys and keys[ord('a')] & p.KEY_IS_DOWN:
+        base_eye_pos -= right * move_speed
+        cam_target -= right * move_speed
+    if ord('d') in keys and keys[ord('d')] & p.KEY_IS_DOWN:
+        base_eye_pos += right * move_speed
+        cam_target += right * move_speed
+    if ord('r') in keys and keys[ord('r')] & p.KEY_IS_DOWN:
+        base_eye_pos[2] += move_speed
+        cam_target[2] += move_speed
+    if ord('f') in keys and keys[ord('f')] & p.KEY_IS_DOWN:
+        base_eye_pos[2] -= move_speed
+        cam_target[2] -= move_speed
     
     #both camera captures images
     left_eye, right_eye = get_stereo_eyes()
@@ -155,8 +186,8 @@ while True:
 
     # input check for 's' key 
     if ord('t') in keys and keys[ord('t')] & p.KEY_WAS_TRIGGERED:
-        l_filename = os.path.join(save_path, f"rect_l_{img_counter}.png")
-        r_filename = os.path.join(save_path, f"rect_r_{img_counter}.png")
+        l_filename = os.path.join(save_path, f"rect_left_{img_counter}.png")
+        r_filename = os.path.join(save_path, f"rect_right_{img_counter}.png")
         
         cv2.imwrite(l_filename, img_left)
         cv2.imwrite(r_filename, img_right)
