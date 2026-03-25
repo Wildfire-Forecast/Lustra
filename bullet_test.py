@@ -6,11 +6,15 @@ import os
 import cv2
 import inspect
 import numpy as np
+from ultralytics import YOLO
 
 current_dir = os.path.dirname(os.path.abspath(inspect.getfile(inspect.currentframe())))
 assets_dir = os.path.join(current_dir, "assets_new")
 
 clicked_point = None
+clicked_ground_point = None
+clicked_depth_value = None
+saved_ground_points = []
 
 # image folder
 save_path = os.path.join(current_dir, "captured_images")
@@ -27,7 +31,7 @@ data_path = pybullet_data.getDataPath()
 p.setAdditionalSearchPath(assets_dir)
 
 plane_id = p.loadURDF(os.path.join(data_path, "plane.urdf"))
-p.changeVisualShape(plane_id, -1, rgbaColor=[0.2, 0.5, 0.2, 1])
+p.changeVisualShape(plane_id, -1, rgbaColor=[1, 1, 1, 1])
 
 # =========================
 # Camera / Stereo Settings
@@ -54,12 +58,93 @@ fx = fy * (width / height)
 
 print("Intrinsics:", "fx=", fx, "fy=", fy, "cx=", cx, "cy=", cy)
 
+# =========================
+# YOLO model
+# =========================
+model_path = os.path.join(current_dir, "last.pt")   # change if needed
+model = YOLO(model_path)
+
+# optional: if your class name is fire, nice for display
+CLASS_NAMES = model.names if hasattr(model, "names") else {0: "fire"}
+
+CONF_THRES = 0.40
+
 
 def _normalize(v):
     n = np.linalg.norm(v)
     if n < 1e-9:
         return v
     return v / n
+
+def draw_topdown_map(
+    drone_pos,
+    target_pos,
+    saved_points,
+    clicked_ground_point=None,
+    map_size_px=800,
+    world_half_extent=80.0
+):
+    """
+    Draw a simple top-down local map using PyBullet world coordinates.
+    x -> horizontal
+    y -> vertical
+    """
+    canvas = np.ones((map_size_px, map_size_px, 3), dtype=np.uint8) * 245
+
+    def world_to_pixel(x, y):
+        px = int((x + world_half_extent) / (2 * world_half_extent) * map_size_px)
+        py = int(map_size_px - ((y + world_half_extent) / (2 * world_half_extent) * map_size_px))
+        return px, py
+
+    # grid
+    for g in range(-80, 81, 20):
+        x1, y1 = world_to_pixel(g, -world_half_extent)
+        x2, y2 = world_to_pixel(g, world_half_extent)
+        cv2.line(canvas, (x1, y1), (x2, y2), (220, 220, 220), 1)
+
+        x1, y1 = world_to_pixel(-world_half_extent, g)
+        x2, y2 = world_to_pixel(world_half_extent, g)
+        cv2.line(canvas, (x1, y1), (x2, y2), (220, 220, 220), 1)
+
+    # axes
+    x1, y1 = world_to_pixel(0, -world_half_extent)
+    x2, y2 = world_to_pixel(0, world_half_extent)
+    cv2.line(canvas, (x1, y1), (x2, y2), (150, 150, 150), 2)
+
+    x1, y1 = world_to_pixel(-world_half_extent, 0)
+    x2, y2 = world_to_pixel(world_half_extent, 0)
+    cv2.line(canvas, (x1, y1), (x2, y2), (150, 150, 150), 2)
+
+    # drone
+    dx, dy = world_to_pixel(drone_pos[0], drone_pos[1])
+    cv2.circle(canvas, (dx, dy), 8, (255, 0, 0), -1)
+    cv2.putText(canvas, "Drone", (dx + 10, dy - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+
+    # target/look point
+    tx, ty = world_to_pixel(target_pos[0], target_pos[1])
+    cv2.circle(canvas, (tx, ty), 6, (0, 180, 0), -1)
+    cv2.putText(canvas, "Target", (tx + 10, ty - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 180, 0), 2)
+
+    # line from drone to target
+    cv2.line(canvas, (dx, dy), (tx, ty), (0, 180, 0), 2)
+
+    # saved points
+    for i, pt in enumerate(saved_points):
+        px, py = world_to_pixel(pt["world"][0], pt["world"][1])
+        cv2.circle(canvas, (px, py), 6, (0, 0, 255), -1)
+        cv2.putText(canvas, f"P{i}", (px + 8, py - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
+
+    # current clicked point
+    if clicked_ground_point is not None:
+        cxp, cyp = world_to_pixel(clicked_ground_point[0], clicked_ground_point[1])
+        cv2.circle(canvas, (cxp, cyp), 8, (0, 140, 255), 2)
+        cv2.putText(canvas, "Current", (cxp + 10, cyp + 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 140, 255), 2)
+
+    return canvas
 
 
 def get_camera_basis():
@@ -111,6 +196,55 @@ def get_camera_image(eye_pos):
 
     rgb_array = np.reshape(np.array(px, dtype=np.uint8), (height, width, 4))
     return cv2.cvtColor(rgb_array[:, :, :3], cv2.COLOR_RGB2BGR)
+
+def run_yolo_on_frame(frame_bgr, conf_thres=0.40):
+    """
+    Run YOLO on a BGR OpenCV image and return detections as dicts.
+    """
+    results = model.predict(
+        source=frame_bgr,
+        conf=conf_thres,
+        verbose=False
+    )
+
+    detections = []
+
+    if not results:
+        return detections
+
+    r = results[0]
+    if r.boxes is None:
+        return detections
+
+    boxes_xyxy = r.boxes.xyxy.cpu().numpy()
+    confs = r.boxes.conf.cpu().numpy()
+    clss = r.boxes.cls.cpu().numpy().astype(int)
+
+    for box, conf, cls_id in zip(boxes_xyxy, confs, clss):
+        x1, y1, x2, y2 = box.astype(int)
+
+        # clamp to image
+        x1 = max(0, min(width - 1, x1))
+        y1 = max(0, min(height - 1, y1))
+        x2 = max(0, min(width - 1, x2))
+        y2 = max(0, min(height - 1, y2))
+
+        cx_box = int((x1 + x2) / 2)
+        cy_box = int((y1 + y2) / 2)
+
+        detections.append({
+            "class_id": cls_id,
+            "class_name": CLASS_NAMES.get(cls_id, str(cls_id)),
+            "conf": float(conf),
+            "x1": x1,
+            "y1": y1,
+            "x2": x2,
+            "y2": y2,
+            "cx": cx_box,
+            "cy": cy_box
+        })
+
+    return detections
 
 
 # =========================
@@ -183,6 +317,63 @@ def patch_median_depth(depth_map, x, y, half_size=6):
         return np.nan
     return float(np.median(vals))
 
+def pixel_to_camera_ray(u, v, fx, fy, cx, cy):
+    """
+    Convert image pixel to a ray direction in camera coordinates.
+    OpenCV-style camera frame:
+      x = right
+      y = down
+      z = forward
+    """
+    x = (u - cx) / fx
+    y = (v - cy) / fy
+    ray_cam = np.array([x, y, 1.0], dtype=np.float32)
+    ray_cam = ray_cam / np.linalg.norm(ray_cam)
+    return ray_cam
+
+
+def camera_ray_to_world(ray_cam, eye_pos, target_pos, up_vec):
+    """
+    Rotate a camera-frame ray into world coordinates.
+    """
+    forward = _normalize(target_pos - eye_pos)
+    right = _normalize(np.cross(forward, up_vec))
+    true_up = _normalize(np.cross(right, forward))
+
+    # Camera-to-world rotation basis
+    # ray_world = x*right + y*true_up? careful:
+    # camera y points DOWN in image coords, but world up is +true_up
+    # therefore use -true_up for camera y axis
+    ray_world = (
+        ray_cam[0] * right +
+        ray_cam[1] * (-true_up) +
+        ray_cam[2] * forward
+    )
+    ray_world = _normalize(ray_world)
+    return ray_world
+
+
+
+
+
+
+
+def intersect_ray_with_ground(ray_origin, ray_dir, ground_z=0.0):
+    """
+    Intersect world ray with horizontal ground plane z = ground_z.
+    Returns None if no valid intersection.
+    """
+    if abs(ray_dir[2]) < 1e-6:
+        return None
+
+    t = (ground_z - ray_origin[2]) / ray_dir[2]
+
+    # Must be in front of the camera
+    if t <= 0:
+        return None
+
+    point = ray_origin + t * ray_dir
+    return point
 
 # =========================
 # Object creation
@@ -283,6 +474,7 @@ print("------ Stereo / Save / Quit -----")
 print("Press 'g' to toggle stereo windows.")
 print("Press 't' to capture images.")
 print("Press 'q' to quit.")
+print("Press 'c' to save current clicked ground point.")
 
 # =========================
 # Main Loop
@@ -322,6 +514,9 @@ while True:
     img_left = get_camera_image(left_eye)
     img_right = get_camera_image(right_eye)
 
+    # YOLO detections on left image
+    detections = run_yolo_on_frame(img_left, conf_thres=CONF_THRES)
+    
     # compute disparity / depth
     disp, depth_m, valid_ratio, disp_vis_u8, depth_vis_u8 = compute_depth_and_visuals(img_left, img_right)
 
@@ -339,26 +534,115 @@ while True:
             "| eye:", np.round(base_eye_pos, 2),
             "| target:", np.round(cam_target, 2)
         )
+        
 
     frame_i += 1
 
     # draw helper points on left image
     debug_left = img_left.copy()
     
+    # =========================
+    # YOLO draw + depth estimate
+    # =========================
+    for det_i, det in enumerate(detections):
+        x1, y1, x2, y2 = det["x1"], det["y1"], det["x2"], det["y2"]
+        bx, by = det["cx"], det["cy"]
+        conf = det["conf"]
+        class_name = det["class_name"]
+
+        # patch-based stereo depth at bbox center
+        fire_depth = patch_median_depth(depth_m, bx, by, half_size=10)
+
+        # distance label
+        if np.isfinite(fire_depth):
+            label = f"{class_name} {conf:.2f} | {fire_depth:.2f} m"
+        else:
+            label = f"{class_name} {conf:.2f} | depth=nan"
+
+        # draw bbox
+        cv2.rectangle(debug_left, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+        # draw center point
+        cv2.circle(debug_left, (bx, by), 5, (0, 165, 255), -1)
+
+        # text
+        cv2.putText(
+            debug_left,
+            label,
+            (x1, max(20, y1 - 10)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (0, 255, 0),
+            2
+        )
+
+        # optional print every 30 frames
+        if frame_i % 30 == 0:
+            print(
+                f"[YOLO] #{det_i} {class_name} conf={conf:.2f} "
+                f"bbox=({x1},{y1},{x2},{y2}) center=({bx},{by}) "
+                f"depth={fire_depth:.2f} m" if np.isfinite(fire_depth)
+                else f"[YOLO] #{det_i} {class_name} conf={conf:.2f} "
+                     f"bbox=({x1},{y1},{x2},{y2}) center=({bx},{by}) depth=nan"
+            )
+    
     if clicked_point is not None:
         px, py = clicked_point
         z_click = patch_median_depth(depth_m, px, py, half_size=8)
+        clicked_depth_value = z_click
+
+        ray_cam = pixel_to_camera_ray(px, py, fx, fy, cx, cy)
+        ray_world = camera_ray_to_world(ray_cam, base_eye_pos, cam_target, cam_up)
+        ground_pt = intersect_ray_with_ground(base_eye_pos, ray_world, ground_z=0.0)
+        clicked_ground_point = ground_pt
+
+        if frame_i % 5 == 0 and clicked_ground_point is not None:
+            print(
+                f"Clicked depth: {z_click:.2f} m" if np.isfinite(z_click) else "Clicked depth: nan",
+                f"| Ground point: ({clicked_ground_point[0]:.2f}, {ground_pt[1]:.2f}, {ground_pt[2]:.2f})"
+            )
 
         cv2.circle(debug_left, (px, py), 7, (0, 0, 255), -1)
+
+        depth_label = f"{z_click:.2f} m" if np.isfinite(z_click) else "nan"
         cv2.putText(
             debug_left,
-            f"{z_click:.2f} m" if np.isfinite(z_click) else "nan",
+            depth_label,
             (px + 10, py - 10),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.6,
             (0, 0, 255),
             2
         )
+
+    if clicked_ground_point is not None:
+        ground_label = f"({clicked_ground_point[0]:.2f}, {clicked_ground_point[1]:.2f})"
+        cv2.putText(
+            debug_left,
+            ground_label,
+            (px + 10, py + 15),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 255, 255),
+            2
+        )
+            
+    if ord('c') in keys and keys[ord('c')] & p.KEY_WAS_TRIGGERED:
+        if clicked_ground_point is not None:
+            saved_ground_points.append({
+                "world": clicked_ground_point.copy(),
+                "depth": clicked_depth_value if clicked_depth_value is not None else np.nan,
+                "drone_eye": base_eye_pos.copy(),
+                "drone_target": cam_target.copy()
+            })
+            print(
+                f"Saved point #{len(saved_ground_points)-1}: "
+                f"world=({clicked_ground_point[0]:.2f}, {clicked_ground_point[1]:.2f}, {clicked_ground_point[2]:.2f}), "
+                f"depth={clicked_depth_value:.2f} m" if clicked_depth_value is not None and np.isfinite(clicked_depth_value)
+                else f"Saved point #{len(saved_ground_points)-1}: world=({clicked_ground_point[0]:.2f}, {clicked_ground_point[1]:.2f}, {clicked_ground_point[2]:.2f}), depth=nan"
+            )
+        else:
+            print("No clicked ground point to save.")
         
         
     cv2.circle(debug_left, (int(cx), int(cy)), 5, (0, 255, 255), -1)
@@ -368,6 +652,17 @@ while True:
     cv2.imshow("Left Eye (Reference)", debug_left)
     cv2.setMouseCallback("Left Eye (Reference)", on_mouse)
     cv2.imshow("Right Eye (Shifted)", img_right)
+    
+    topdown = draw_topdown_map(
+        drone_pos=base_eye_pos,
+        target_pos=cam_target,
+        saved_points=saved_ground_points,
+        clicked_ground_point=clicked_ground_point,
+        map_size_px=800,
+        world_half_extent=80.0
+    )
+
+    cv2.imshow("Top-Down Map", topdown)
 
     if show_stereo:
         cv2.imshow("Disparity", disp_vis_u8)
