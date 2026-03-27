@@ -1,6 +1,10 @@
 <?xml version="1.0" ?>
 <robot name="oak">
+
   <link name="baseLink">
+    <inertial>
+      <mass value="0.0"/> <inertia ixx="0" ixy="0" ixz="0" iyy="0" iyz="0" izz="0"/>
+    </inertial>
     <visual>
       <origin rpy="0 0 0" xyz="0 0 0"/>
       <geometry>
@@ -10,9 +14,19 @@
         <color rgba="0.4 0.2 0.1 1.0"/>
       </material>
     </visual>
+    <collision>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <mesh filename="trunk.obj" scale="1 1 1"/>
+      </geometry>
+    </collision>
   </link>
 
   <link name="leafLink">
+    <inertial>
+      <mass value="0.0"/>
+      <inertia ixx="0" ixy="0" ixz="0" iyy="0" iyz="0" izz="0"/>
+    </inertial>
     <visual>
       <origin rpy="0 0 0" xyz="0 0 0"/>
       <geometry>
@@ -22,7 +36,7 @@
         <color rgba="0.1 0.5 0.1 1.0"/>
       </material>
     </visual>
-  </link>
+    </link>
 
   <joint name="trunk_to_leaves" type="fixed">
     <parent link="baseLink"/>

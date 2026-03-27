@@ -36,14 +36,12 @@ p.setGravity(0, 0, -9.8)
 data_path = pybullet_data.getDataPath()
 p.setAdditionalSearchPath(assets_dir)
 
-plane_id = p.loadURDF(os.path.join(data_path, "plane.urdf"))
-p.changeVisualShape(plane_id, -1, rgbaColor=[1, 1, 1, 1])
 
 # --- Initialize World Builder ---
 wb = WorldBuilder(assets_dir)
 wb.setup_base_world()
-wb.build_default_scene()
-wb.create_tiled_ground(tile_size=4, grid_range=20, random_chance=0.15)
+wb.build_biome_world(tile_size=4, grid_range=25)
+wb.create_fire_sphere(position=[5, 5, 1])
 
 # =========================
 # Camera / Stereo Settings
@@ -315,7 +313,6 @@ def run_yolo_on_frame(frame_bgr, conf_thres=0.40):
 
     return detections
 
-
 # =========================
 # Stereo matcher
 # =========================
@@ -335,7 +332,6 @@ stereo = cv2.StereoSGBM_create(
     preFilterCap=31,
     mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY
 )
-
 
 def compute_depth_and_visuals(img_left, img_right):
     """
@@ -400,7 +396,6 @@ def pixel_to_camera_ray(u, v, fx, fy, cx, cy):
     ray_cam = ray_cam / np.linalg.norm(ray_cam)
     return ray_cam
 
-
 def camera_ray_to_world(ray_cam, eye_pos, target_pos, up_vec):
     """
     Rotate a camera-frame ray into world coordinates.
@@ -420,12 +415,6 @@ def camera_ray_to_world(ray_cam, eye_pos, target_pos, up_vec):
     )
     ray_world = _normalize(ray_world)
     return ray_world
-
-
-
-
-
-
 
 def intersect_ray_with_ground(ray_origin, ray_dir, ground_z=0.0):
     """
@@ -480,12 +469,16 @@ while True:
     forward, right, _ = get_camera_basis()
 
     # movement
+    raw_forward = cam_target - base_eye_pos
+    forward_horizontal = np.array([raw_forward[0], raw_forward[1], 0])
+    if np.linalg.norm(forward_horizontal) > 0:
+        forward_horizontal /= np.linalg.norm(forward_horizontal)
     if ord('w') in keys and keys[ord('w')] & p.KEY_IS_DOWN:
-        base_eye_pos += forward * move_speed
-        cam_target += forward * move_speed
+        base_eye_pos += forward_horizontal * move_speed
+        cam_target += forward_horizontal * move_speed
     if ord('x') in keys and keys[ord('x')] & p.KEY_IS_DOWN:
-        base_eye_pos -= forward * move_speed
-        cam_target -= forward * move_speed
+        base_eye_pos -= forward_horizontal * move_speed
+        cam_target -= forward_horizontal * move_speed
     if ord('a') in keys and keys[ord('a')] & p.KEY_IS_DOWN:
         base_eye_pos -= right * move_speed
         cam_target -= right * move_speed
