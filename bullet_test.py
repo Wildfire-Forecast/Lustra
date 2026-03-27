@@ -81,6 +81,7 @@ def draw_topdown_map(
     target_pos,
     saved_points,
     clicked_ground_point=None,
+    yolo_ground_polygons=None,
     map_size_px=800,
     world_half_extent=80.0
 ):
@@ -143,9 +144,65 @@ def draw_topdown_map(
         cv2.circle(canvas, (cxp, cyp), 8, (0, 140, 255), 2)
         cv2.putText(canvas, "Current", (cxp + 10, cyp + 15),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 140, 255), 2)
+        
+        # YOLO projected bbox corners on ground
+    if yolo_ground_polygons is not None:
+        for det_i, poly in enumerate(yolo_ground_polygons):
+            pts_px = []
+
+            for pt in poly:
+                if pt is None:
+                    continue
+                px, py = world_to_pixel(pt[0], pt[1])
+                pts_px.append((px, py))
+
+                # draw each corner point
+                cv2.circle(canvas, (px, py), 4, (255, 0, 255), -1)
+
+            # if we have enough valid points, connect them
+            if len(pts_px) >= 2:
+                for i in range(len(pts_px)):
+                    p1 = pts_px[i]
+                    p2 = pts_px[(i + 1) % len(pts_px)]
+                    cv2.line(canvas, p1, p2, (255, 0, 255), 2)
+
+            # label polygon
+            if len(pts_px) > 0:
+                cv2.putText(
+                    canvas,
+                    f"Y{det_i}",
+                    (pts_px[0][0] + 6, pts_px[0][1] - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45,
+                    (255, 0, 255),
+                    1
+                )
 
     return canvas
 
+def project_bbox_corners_to_ground(x1, y1, x2, y2, eye_pos, target_pos, up_vec):
+    """
+    Project the 4 image bbox corners onto the ground plane z=0.
+    Returns a list of 4 points in world coordinates (or None where invalid).
+    Order:
+      top-left, top-right, bottom-right, bottom-left
+    """
+    corners_img = [
+        (x1, y1),  # top-left
+        (x2, y1),  # top-right
+        (x2, y2),  # bottom-right
+        (x1, y2),  # bottom-left
+    ]
+
+    ground_pts = []
+
+    for (u, v) in corners_img:
+        ray_cam = pixel_to_camera_ray(u, v, fx, fy, cx, cy)
+        ray_world = camera_ray_to_world(ray_cam, eye_pos, target_pos, up_vec)
+        ground_pt = intersect_ray_with_ground(eye_pos, ray_world, ground_z=0.0)
+        ground_pts.append(ground_pt)
+
+    return ground_pts
 
 def get_camera_basis():
     """
@@ -541,6 +598,8 @@ while True:
     # draw helper points on left image
     debug_left = img_left.copy()
     
+    yolo_ground_polygons = []
+    
     # =========================
     # YOLO draw + depth estimate
     # =========================
@@ -549,6 +608,15 @@ while True:
         bx, by = det["cx"], det["cy"]
         conf = det["conf"]
         class_name = det["class_name"]
+        
+        # project bbox corners to ground for top-down map
+        ground_poly = project_bbox_corners_to_ground(
+            x1, y1, x2, y2,
+            base_eye_pos,
+            cam_target,
+            cam_up
+        )
+        yolo_ground_polygons.append(ground_poly)
 
         # patch-based stereo depth at bbox center
         fire_depth = patch_median_depth(depth_m, bx, by, half_size=10)
@@ -615,7 +683,8 @@ while True:
             2
         )
 
-    if clicked_ground_point is not None:
+    if clicked_ground_point is not None and clicked_point is not None:
+        px, py = clicked_point
         ground_label = f"({clicked_ground_point[0]:.2f}, {clicked_ground_point[1]:.2f})"
         cv2.putText(
             debug_left,
@@ -625,7 +694,7 @@ while True:
             0.5,
             (255, 255, 255),
             2
-        )
+    )
             
     if ord('c') in keys and keys[ord('c')] & p.KEY_WAS_TRIGGERED:
         if clicked_ground_point is not None:
@@ -658,6 +727,7 @@ while True:
         target_pos=cam_target,
         saved_points=saved_ground_points,
         clicked_ground_point=clicked_ground_point,
+        yolo_ground_polygons=yolo_ground_polygons,
         map_size_px=800,
         world_half_extent=80.0
     )
