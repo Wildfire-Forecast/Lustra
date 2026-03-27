@@ -1,5 +1,6 @@
 import pybullet as p
 import pybullet_data
+from world_builder import WorldBuilder
 import time
 import random
 import os
@@ -23,7 +24,12 @@ if not os.path.exists(save_path):
 
 # --- PyBullet setup ---
 cid = p.connect(p.GUI, options="--disable-example-browser")
+
+p.setInternalSimFlags(0)
 p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0)
+p.configureDebugVisualizer(p.COV_ENABLE_SEGMENTATION_MARK_PREVIEW, 0)
+p.configureDebugVisualizer(p.COV_ENABLE_DEPTH_BUFFER_PREVIEW, 0)
+p.configureDebugVisualizer(p.COV_ENABLE_RGB_BUFFER_PREVIEW, 0)
 p.configureDebugVisualizer(p.COV_ENABLE_SHADOWS, 1)
 
 p.setGravity(0, 0, -9.8)
@@ -32,6 +38,12 @@ p.setAdditionalSearchPath(assets_dir)
 
 plane_id = p.loadURDF(os.path.join(data_path, "plane.urdf"))
 p.changeVisualShape(plane_id, -1, rgbaColor=[1, 1, 1, 1])
+
+# --- Initialize World Builder ---
+wb = WorldBuilder(assets_dir)
+wb.setup_base_world()
+wb.build_default_scene()
+wb.create_tiled_ground(tile_size=4, grid_range=20, random_chance=0.15)
 
 # =========================
 # Camera / Stereo Settings
@@ -431,81 +443,6 @@ def intersect_ray_with_ground(ray_origin, ray_dir, ground_z=0.0):
 
     point = ray_origin + t * ray_dir
     return point
-
-# =========================
-# Object creation
-# =========================
-def create_fire_sphere(position=[0, 0, 5], radius=1.5):
-    visual_id = p.createVisualShape(
-        shapeType=p.GEOM_SPHERE,
-        radius=radius,
-        rgbaColor=[1, 0, 0, 1]
-    )
-    return p.createMultiBody(
-        baseMass=0,
-        baseVisualShapeIndex=visual_id,
-        basePosition=position
-    )
-
-
-def create_sphere_grid(start_pos, rows, cols, radius=1.5):
-    spacing = radius * 2
-    for i in range(rows):
-        for j in range(cols):
-            create_fire_sphere(
-                position=[start_pos[0] + i * spacing, start_pos[1] + j * spacing, start_pos[2]],
-                radius=radius
-            )
-
-
-def load_custom_object(urdf_filename, position=[0, 0, 0], orientation=[0, 0, 0, 1]):
-    try:
-        obj_id = p.loadURDF(
-            urdf_filename,
-            basePosition=position,
-            baseOrientation=orientation,
-            useFixedBase=True
-        )
-
-        obj_folder = os.path.dirname(urdf_filename)
-        tex_path = os.path.join(assets_dir, obj_folder, "leaf_pattern.png")
-
-        if os.path.exists(tex_path):
-            tex_id = p.loadTexture(tex_path)
-            p.changeVisualShape(obj_id, 0, textureUniqueId=tex_id, rgbaColor=[1, 1, 1, 1])
-
-        return obj_id
-
-    except Exception as e:
-        print(f"Error loading {urdf_filename}: {e}")
-        return None
-
-
-# --- random positioning ---
-area_size = 80
-placed_positions = []
-
-
-def place_randomly(urdf_list, count, min_dist):
-    placed = 0
-    attempts = 0
-    while placed < count and attempts < 1000:
-        pos = [random.uniform(-area_size, area_size), random.uniform(-area_size, area_size), 0]
-        if all(np.linalg.norm(np.array(pos) - np.array(p_pos)) > min_dist for p_pos in placed_positions):
-            path = random.choice(urdf_list)
-            rot = p.getQuaternionFromEuler([0, 0, random.uniform(0, 6.28)])
-            load_custom_object(path, position=pos, orientation=rot)
-            placed_positions.append(pos)
-            placed += 1
-        attempts += 1
-
-
-# Scene
-place_randomly(["pinusbruita/pinusbruita.urdf", "oak/oak.urdf", "tree/tree.urdf"], 80, 5.0)
-create_sphere_grid(start_pos=[-10, -10, 2], rows=4, cols=3)
-create_sphere_grid(start_pos=[10, 10, 2], rows=2, cols=3)
-place_randomly(["smallrock/smallrock.urdf", "mediumrock/mediumrock.urdf", "bigrock/bigrock.urdf"], 80, 3.0)
-place_randomly(["bush/bush.urdf"], 90, 2.5)
 
 # Debug camera
 p.resetDebugVisualizerCamera(
