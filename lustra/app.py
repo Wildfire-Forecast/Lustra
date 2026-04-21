@@ -1,6 +1,7 @@
 import os
 import threading
 import time
+import csv
 from collections import deque
 
 import cv2
@@ -60,9 +61,14 @@ class LustraApp:
         self.frame_i = 0
         self.show_stereo = True
         self.fire_body_id = None
-        self.fire_abs_errors_m = deque(maxlen=5000)
+        self.clicked_abs_errors_m = deque(maxlen=5000)
+        self.depth_compare_csv = os.path.join(self.paths.captured_images_dir, "clicked_depth_comparisons.csv")
+        self.last_clicked_comparison = None
         self.current_left_eye = self.base_eye_pos.copy()
         self.current_left_target = self.cam_target.copy()
+        self.current_left_depth_m = None
+        self.current_left_seg_mask = None
+        self._init_depth_compare_csv()
 
     def _load_detector_worker(self):
         try:
@@ -125,6 +131,32 @@ class LustraApp:
         print("Press 't' to capture images.")
         print("Press 'q' to quit.")
         print("Press 'c' to save current clicked ground point.")
+        print(f"Clicked-point depth comparisons are logged to: {self.depth_compare_csv}")
+
+    def _init_depth_compare_csv(self):
+        if os.path.exists(self.depth_compare_csv) and os.path.getsize(self.depth_compare_csv) > 0:
+            return
+        with open(self.depth_compare_csv, "w", newline="", encoding="utf-8") as csv_file:
+            writer = csv.writer(csv_file)
+            writer.writerow(
+                [
+                    "timestamp_unix",
+                    "frame",
+                    "pixel_x",
+                    "pixel_y",
+                    "estimated_range_m",
+                    "true_range_m",
+                    "abs_error_m",
+                    "rel_error_pct",
+                    "eye_x",
+                    "eye_y",
+                    "eye_z",
+                    "hit_x",
+                    "hit_y",
+                    "hit_z",
+                    "hit_body_id",
+                ]
+            )
 
     def compute_range_from_depth(self, depth_z, px, py):
         if not np.isfinite(depth_z):
@@ -134,17 +166,130 @@ class LustraApp:
             return np.nan
         return float(depth_z / ray_cam[2])
 
-    def update_fire_error_stats(self, pred_range_m, eye_pos):
-        if self.fire_body_id is None or not np.isfinite(pred_range_m):
-            return
-        fire_pos, _ = p.getBasePositionAndOrientation(self.fire_body_id)
-        true_range_m = float(np.linalg.norm(np.array(fire_pos, dtype=np.float32) - eye_pos))
-        self.fire_abs_errors_m.append(abs(pred_range_m - true_range_m))
+    def get_true_range_at_pixel(self, px, py):
+        if self.current_left_depth_m is None or self.current_left_seg_mask is None:
+            return np.nan, None, -1
+        if px < 0 or py < 0 or px >= self.width or py >= self.height:
+            return np.nan, None, -1
 
-    def get_fire_error_band(self, percentile=95):
-        if len(self.fire_abs_errors_m) < 20:
+        depth_z = float(self.current_left_depth_m[py, px])
+        if not np.isfinite(depth_z) or depth_z <= 0.0:
+            return np.nan, None, -1
+
+        ray_cam = pixel_to_camera_ray(px, py, self.fx, self.fy, self.cx, self.cy)
+        if ray_cam[2] <= 1e-6:
+            return np.nan, None, -1
+        true_range_m = float(depth_z / ray_cam[2])
+
+        ray_world = camera_ray_to_world(ray_cam, self.current_left_eye, self.current_left_target, self.cam_up)
+        hit_pos = self.current_left_eye + ray_world * true_range_m
+
+        seg_val = int(self.current_left_seg_mask[py, px])
+        if seg_val < 0:
+            hit_body_id = -1
+        else:
+            hit_body_id = seg_val & ((1 << 24) - 1)
+        return true_range_m, hit_pos, hit_body_id
+
+    def build_clicked_comparison(self, pred_range_m, eye_pos, frame_i, px, py):
+        if not np.isfinite(pred_range_m):
+            return None
+        true_range_m, hit_pos, hit_body_id = self.get_true_range_at_pixel(px, py)
+        if not np.isfinite(true_range_m):
+            return None
+        abs_error_m = abs(pred_range_m - true_range_m)
+        rel_error_pct = (abs_error_m / max(true_range_m, 1e-6)) * 100.0
+        self.clicked_abs_errors_m.append(abs_error_m)
+        return {
+            "timestamp_unix": time.time(),
+            "frame": frame_i,
+            "pixel_x": int(px),
+            "pixel_y": int(py),
+            "estimated_range_m": float(pred_range_m),
+            "true_range_m": true_range_m,
+            "abs_error_m": abs_error_m,
+            "rel_error_pct": float(rel_error_pct),
+            "eye_x": float(eye_pos[0]),
+            "eye_y": float(eye_pos[1]),
+            "eye_z": float(eye_pos[2]),
+            "hit_x": float(hit_pos[0]),
+            "hit_y": float(hit_pos[1]),
+            "hit_z": float(hit_pos[2]),
+            "hit_body_id": hit_body_id,
+        }
+
+    def append_clicked_comparison_to_csv(self, row):
+        with open(self.depth_compare_csv, "a", newline="", encoding="utf-8") as csv_file:
+            writer = csv.writer(csv_file)
+            writer.writerow(
+                [
+                    f"{row['timestamp_unix']:.6f}",
+                    row["frame"],
+                    row["pixel_x"],
+                    row["pixel_y"],
+                    f"{row['estimated_range_m']:.6f}",
+                    f"{row['true_range_m']:.6f}",
+                    f"{row['abs_error_m']:.6f}",
+                    f"{row['rel_error_pct']:.4f}",
+                    f"{row['eye_x']:.6f}",
+                    f"{row['eye_y']:.6f}",
+                    f"{row['eye_z']:.6f}",
+                    f"{row['hit_x']:.6f}",
+                    f"{row['hit_y']:.6f}",
+                    f"{row['hit_z']:.6f}",
+                    row["hit_body_id"],
+                ]
+            )
+
+    def get_clicked_error_band(self, percentile=95):
+        if len(self.clicked_abs_errors_m) < 20:
             return np.nan
-        return float(np.percentile(np.array(self.fire_abs_errors_m, dtype=np.float32), percentile))
+        return float(np.percentile(np.array(self.clicked_abs_errors_m, dtype=np.float32), percentile))
+
+    def make_depth_comparison_panel(self):
+        panel_h, panel_w = 360, 640
+        panel = np.full((panel_h, panel_w, 3), 22, dtype=np.uint8)
+        cv2.putText(panel, "Depth Comparison", (20, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (200, 220, 255), 2)
+
+        if self.last_clicked_comparison is None:
+            cv2.putText(panel, "Click on Left Eye to start depth comparison...", (20, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 2)
+            return panel
+
+        c = self.last_clicked_comparison
+        abs_errors = np.array(self.clicked_abs_errors_m, dtype=np.float32)
+        mean_err = float(np.mean(abs_errors)) if len(abs_errors) else np.nan
+        med_err = float(np.median(abs_errors)) if len(abs_errors) else np.nan
+        p95_err = self.get_clicked_error_band(95)
+
+        stats_lines = [
+            f"Pixel: ({c['pixel_x']}, {c['pixel_y']}) | Hit body: {c['hit_body_id']}",
+            f"Estimated range: {c['estimated_range_m']:.2f} m",
+            f"True range:      {c['true_range_m']:.2f} m",
+            f"Abs error:       {c['abs_error_m']:.2f} m",
+            f"Rel error:       {c['rel_error_pct']:.1f} %",
+            f"Samples: {len(self.clicked_abs_errors_m)} | Mean: {mean_err:.2f} | Median: {med_err:.2f} | P95: {p95_err:.2f}",
+        ]
+        y = 72
+        for line in stats_lines:
+            cv2.putText(panel, line, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (235, 235, 235), 1)
+            y += 26
+
+        x0, y0, w, h = 20, 180, 600, 160
+        cv2.rectangle(panel, (x0, y0), (x0 + w, y0 + h), (120, 120, 120), 1)
+        tail = abs_errors[-200:]
+        if len(tail) >= 2:
+            y_max = max(1.0, float(np.percentile(tail, 95)) * 1.2, float(np.max(tail)))
+            prev = None
+            for i, value in enumerate(tail):
+                x = x0 + int((i / (len(tail) - 1)) * (w - 1))
+                y_plot = y0 + h - 1 - int((min(float(value), y_max) / y_max) * (h - 1))
+                point = (x, y_plot)
+                if prev is not None:
+                    cv2.line(panel, prev, point, (40, 210, 80), 2)
+                prev = point
+            cv2.putText(panel, f"Abs error trend (last {len(tail)}), y-max {y_max:.1f} m", (x0 + 8, y0 + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
+
+        return panel
 
     def on_mouse(self, event, x, y, flags, param):
         del flags, param
@@ -176,6 +321,12 @@ class LustraApp:
         px, py = self.clicked_point
         z_click = self.stereo_processor.patch_median_depth(depth_m, px, py, half_size=8)
         self.clicked_depth_value = z_click
+        click_range_m = self.compute_range_from_depth(z_click, px, py)
+        comparison = self.build_clicked_comparison(click_range_m, self.current_left_eye, self.frame_i, px, py)
+        if comparison is not None:
+            self.last_clicked_comparison = comparison
+            self.append_clicked_comparison_to_csv(comparison)
+        error_band_95 = self.get_clicked_error_band(percentile=95)
 
         ray_cam = pixel_to_camera_ray(px, py, self.fx, self.fy, self.cx, self.cy)
         ray_world = camera_ray_to_world(ray_cam, self.current_left_eye, self.current_left_target, self.cam_up)
@@ -189,7 +340,13 @@ class LustraApp:
             )
 
         cv2.circle(debug_left, (px, py), 7, (0, 0, 255), -1)
-        depth_label = f"{z_click:.2f} m" if np.isfinite(z_click) else "nan"
+        if np.isfinite(click_range_m):
+            if np.isfinite(error_band_95):
+                depth_label = f"{click_range_m:.2f} m ±{error_band_95:.1f}"
+            else:
+                depth_label = f"{click_range_m:.2f} m"
+        else:
+            depth_label = "nan"
         cv2.putText(debug_left, depth_label, (px + 10, py - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
         if self.clicked_ground_point is not None:
@@ -274,7 +431,7 @@ class LustraApp:
             )
             self.current_left_eye = left_eye
             self.current_left_target = left_target
-            img_left = get_camera_image(
+            img_left, left_depth_m, left_seg_mask = get_camera_image(
                 left_eye,
                 left_target,
                 self.cam_up,
@@ -283,7 +440,10 @@ class LustraApp:
                 self.height,
                 self.near_val,
                 self.far_val,
+                return_depth_and_seg=True,
             )
+            self.current_left_depth_m = left_depth_m
+            self.current_left_seg_mask = left_seg_mask
             img_right = get_camera_image(
                 right_eye,
                 right_target,
@@ -341,13 +501,8 @@ class LustraApp:
 
                 fire_depth_z = self.stereo_processor.patch_median_depth(depth_m, bx, by, half_size=10)
                 fire_range_m = self.compute_range_from_depth(fire_depth_z, bx, by)
-                self.update_fire_error_stats(fire_range_m, left_eye)
-                error_band_95 = self.get_fire_error_band(percentile=95)
                 if np.isfinite(fire_range_m):
-                    if np.isfinite(error_band_95):
-                        label = f"{class_name} {conf:.2f} | {fire_range_m:.2f} m ±{error_band_95:.1f}"
-                    else:
-                        label = f"{class_name} {conf:.2f} | {fire_range_m:.2f} m"
+                    label = f"{class_name} {conf:.2f} | {fire_range_m:.2f} m"
                 else:
                     label = f"{class_name} {conf:.2f} | range=nan"
 
@@ -368,7 +523,6 @@ class LustraApp:
                         f"[YOLO] #{det_i} {class_name} conf={conf:.2f} "
                         f"bbox=({x1},{y1},{x2},{y2}) center=({bx},{by}) "
                         f"range={fire_range_m:.2f} m"
-                        + (f" | 95% abs err ±{error_band_95:.2f} m" if np.isfinite(error_band_95) else "")
                         if np.isfinite(fire_range_m)
                         else f"[YOLO] #{det_i} {class_name} conf={conf:.2f} "
                         f"bbox=({x1},{y1},{x2},{y2}) center=({bx},{by}) range=nan"
@@ -414,6 +568,7 @@ class LustraApp:
                 world_half_extent=80.0,
             )
             cv2.imshow("Top-Down Map", topdown)
+            cv2.imshow("Depth Comparison", self.make_depth_comparison_panel())
 
             if self.show_stereo:
                 cv2.imshow("Disparity", disp_vis_u8)

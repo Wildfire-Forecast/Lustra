@@ -22,7 +22,7 @@ def get_parallel_stereo_views(base_eye_pos, cam_target, cam_up, baseline_m):
     return left_eye, right_eye, left_target, right_target
 
 
-def get_camera_image(eye_pos, cam_target, cam_up, fov, width, height, near_val, far_val):
+def get_camera_image(eye_pos, cam_target, cam_up, fov, width, height, near_val, far_val, return_depth_and_seg=False):
     view_matrix = p.computeViewMatrix(
         cameraEyePosition=eye_pos.tolist(),
         cameraTargetPosition=cam_target.tolist(),
@@ -36,13 +36,22 @@ def get_camera_image(eye_pos, cam_target, cam_up, fov, width, height, near_val, 
         farVal=far_val,
     )
 
-    (_, _, px, _, _) = p.getCameraImage(
+    flags = p.ER_SEGMENTATION_MASK_OBJECT_AND_LINKINDEX if return_depth_and_seg else p.ER_NO_SEGMENTATION_MASK
+    (_, _, px, depth_buffer, seg_mask) = p.getCameraImage(
         width=width,
         height=height,
         viewMatrix=view_matrix,
         projectionMatrix=proj_matrix,
         renderer=p.ER_BULLET_HARDWARE_OPENGL,
+        flags=flags,
     )
 
     rgb_array = np.reshape(np.array(px, dtype=np.uint8), (height, width, 4))
-    return cv2.cvtColor(rgb_array[:, :, :3], cv2.COLOR_RGB2BGR)
+    bgr = cv2.cvtColor(rgb_array[:, :, :3], cv2.COLOR_RGB2BGR)
+    if not return_depth_and_seg:
+        return bgr
+
+    depth_buffer = np.reshape(np.array(depth_buffer, dtype=np.float32), (height, width))
+    depth_m = (far_val * near_val) / (far_val - (far_val - near_val) * depth_buffer)
+    seg_mask = np.reshape(np.array(seg_mask, dtype=np.int32), (height, width))
+    return bgr, depth_m.astype(np.float32), seg_mask
