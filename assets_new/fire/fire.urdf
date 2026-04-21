@@ -1,0 +1,28 @@
+<?xml version="1.0" ?>
+<robot name="fire">
+  <link name="baseLink">
+
+    <visual>
+      <origin rpy="0 0 0" xyz="0 0 0.0"/> 
+      <geometry>
+        <mesh filename="fire.obj" scale="7 7 7"/>
+      </geometry>
+      <material name="red">
+        <color rgba="1 0 0 1.0"/>
+      </material>
+    </visual>
+    
+    <collision>
+      <origin rpy="0 0 0" xyz="0 0 0.0"/> 
+      <geometry>
+        <mesh filename="fire.obj" scale="0 0 0"/>
+        
+        </geometry>
+    </collision>
+
+    <inertial>
+      <mass value="0.0"/> <origin rpy="0 0 0" xyz="0 0 0.0"/>
+      <inertia ixx="0" ixy="0" ixz="0" iyy="0" iyz="0" izz="0"/>
+    </inertial>
+  </link>
+</robot>

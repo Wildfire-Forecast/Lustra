@@ -20,6 +20,7 @@ class WorldBuilder:
             "tree": "tree/tree.urdf",
             "rock": random.choice(["smallrock/smallrock.urdf", "mediumrock/mediumrock.urdf", "bigrock/bigrock.urdf"]),
             "bush": "bush/bush.urdf",
+            "fire": "fire/fire.urdf",
         }
 
         if asset_type in mapping:
@@ -132,7 +133,24 @@ class WorldBuilder:
             print(f"Error loading {urdf_filename}: {e}")
             return None
 
-    def create_fire_sphere(self, position=[0, 0, 5], radius=1.5):
-        visual_id = p.createVisualShape(p.GEOM_SPHERE, radius=radius, rgbaColor=[1, 0, 0, 1])
-        return p.createMultiBody(0, -1, visual_id, position)
+    def spawn_fire(self, center_pos, offset=1.5):
+        plus_offsets = [
+            [0, 0],           
+            [offset, 0],      
+            [-offset, 0],     
+            [0, offset],      
+            [0, -offset]      
+        ]
+        
+        spawned_ids = []
+        
+        for dx, dy in plus_offsets:
+            spawn_pos = [center_pos[0] + dx, center_pos[1] + dy, center_pos[2]]
+            
+            fire_id = self.spawn_asset_by_type("fire", spawn_pos)
+            
+            if fire_id is not None:
+                spawned_ids.append(fire_id)
+                
+        return spawned_ids
 

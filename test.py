@@ -28,7 +28,7 @@ p.setAdditionalSearchPath(assets_dir)
 wb = WorldBuilder(assets_dir)
 wb.setup_base_world()
 wb.build_biome_world(tile_size=4, grid_range=25)
-wb.create_fire_sphere(position=[5, 5, 1])
+wb.spawn_fire(center_pos=[5, 5, 1])
 
 
 cam_target = [8.0, 8.0, 0.0]
