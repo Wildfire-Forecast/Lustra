@@ -1,6 +1,7 @@
 import os
 import threading
 import time
+from collections import deque
 
 import cv2
 import numpy as np
@@ -9,7 +10,7 @@ import pybullet_data
 
 from .config import get_project_paths
 from .visualization import draw_topdown_map
-from .vision.camera import get_camera_image, get_stereo_eyes
+from .vision.camera import get_camera_image, get_parallel_stereo_views
 from .vision.geometry import camera_ray_to_world, get_camera_basis, intersect_ray_with_ground, pixel_to_camera_ray
 from .vision.stereo import StereoProcessor
 from .world import WorldBuilder
@@ -58,6 +59,10 @@ class LustraApp:
         self.img_counter = 0
         self.frame_i = 0
         self.show_stereo = True
+        self.fire_body_id = None
+        self.fire_abs_errors_m = deque(maxlen=5000)
+        self.current_left_eye = self.base_eye_pos.copy()
+        self.current_left_target = self.cam_target.copy()
 
     def _load_detector_worker(self):
         try:
@@ -97,7 +102,7 @@ class LustraApp:
         wb = WorldBuilder(self.paths.assets_dir)
         wb.setup_base_world()
         wb.build_biome_world(tile_size=4, grid_range=25)
-        wb.create_fire_sphere(position=[5, 5, 1])
+        self.fire_body_id = wb.create_fire_sphere(position=[5, 5, 1])
 
         p.resetDebugVisualizerCamera(
             cameraDistance=40,
@@ -121,6 +126,26 @@ class LustraApp:
         print("Press 'q' to quit.")
         print("Press 'c' to save current clicked ground point.")
 
+    def compute_range_from_depth(self, depth_z, px, py):
+        if not np.isfinite(depth_z):
+            return np.nan
+        ray_cam = pixel_to_camera_ray(px, py, self.fx, self.fy, self.cx, self.cy)
+        if ray_cam[2] <= 1e-6:
+            return np.nan
+        return float(depth_z / ray_cam[2])
+
+    def update_fire_error_stats(self, pred_range_m, eye_pos):
+        if self.fire_body_id is None or not np.isfinite(pred_range_m):
+            return
+        fire_pos, _ = p.getBasePositionAndOrientation(self.fire_body_id)
+        true_range_m = float(np.linalg.norm(np.array(fire_pos, dtype=np.float32) - eye_pos))
+        self.fire_abs_errors_m.append(abs(pred_range_m - true_range_m))
+
+    def get_fire_error_band(self, percentile=95):
+        if len(self.fire_abs_errors_m) < 20:
+            return np.nan
+        return float(np.percentile(np.array(self.fire_abs_errors_m, dtype=np.float32), percentile))
+
     def on_mouse(self, event, x, y, flags, param):
         del flags, param
         if event == cv2.EVENT_LBUTTONDOWN:
@@ -135,10 +160,12 @@ class LustraApp:
             (x1, y2),
         ]
         ground_pts = []
+        eye_pos = self.current_left_eye
+        target_pos = self.current_left_target
         for (u, v) in corners_img:
             ray_cam = pixel_to_camera_ray(u, v, self.fx, self.fy, self.cx, self.cy)
-            ray_world = camera_ray_to_world(ray_cam, self.base_eye_pos, self.cam_target, self.cam_up)
-            ground_pt = intersect_ray_with_ground(self.base_eye_pos, ray_world, ground_z=0.0)
+            ray_world = camera_ray_to_world(ray_cam, eye_pos, target_pos, self.cam_up)
+            ground_pt = intersect_ray_with_ground(eye_pos, ray_world, ground_z=0.0)
             ground_pts.append(ground_pt)
         return ground_pts
 
@@ -151,8 +178,8 @@ class LustraApp:
         self.clicked_depth_value = z_click
 
         ray_cam = pixel_to_camera_ray(px, py, self.fx, self.fy, self.cx, self.cy)
-        ray_world = camera_ray_to_world(ray_cam, self.base_eye_pos, self.cam_target, self.cam_up)
-        ground_pt = intersect_ray_with_ground(self.base_eye_pos, ray_world, ground_z=0.0)
+        ray_world = camera_ray_to_world(ray_cam, self.current_left_eye, self.current_left_target, self.cam_up)
+        ground_pt = intersect_ray_with_ground(self.current_left_eye, ray_world, ground_z=0.0)
         self.clicked_ground_point = ground_pt
 
         if self.frame_i % 5 == 0 and self.clicked_ground_point is not None:
@@ -242,10 +269,14 @@ class LustraApp:
             if ord("g") in keys and keys[ord("g")] & p.KEY_WAS_TRIGGERED:
                 self.show_stereo = not self.show_stereo
 
-            left_eye, right_eye = get_stereo_eyes(self.base_eye_pos, self.cam_target, self.cam_up, self.baseline_m)
+            left_eye, right_eye, left_target, right_target = get_parallel_stereo_views(
+                self.base_eye_pos, self.cam_target, self.cam_up, self.baseline_m
+            )
+            self.current_left_eye = left_eye
+            self.current_left_target = left_target
             img_left = get_camera_image(
                 left_eye,
-                self.cam_target,
+                left_target,
                 self.cam_up,
                 self.fov,
                 self.width,
@@ -255,7 +286,7 @@ class LustraApp:
             )
             img_right = get_camera_image(
                 right_eye,
-                self.cam_target,
+                right_target,
                 self.cam_up,
                 self.fov,
                 self.width,
@@ -308,11 +339,17 @@ class LustraApp:
                 ground_poly = self.project_bbox_corners_to_ground(x1, y1, x2, y2)
                 yolo_ground_polygons.append(ground_poly)
 
-                fire_depth = self.stereo_processor.patch_median_depth(depth_m, bx, by, half_size=10)
-                if np.isfinite(fire_depth):
-                    label = f"{class_name} {conf:.2f} | {fire_depth:.2f} m"
+                fire_depth_z = self.stereo_processor.patch_median_depth(depth_m, bx, by, half_size=10)
+                fire_range_m = self.compute_range_from_depth(fire_depth_z, bx, by)
+                self.update_fire_error_stats(fire_range_m, left_eye)
+                error_band_95 = self.get_fire_error_band(percentile=95)
+                if np.isfinite(fire_range_m):
+                    if np.isfinite(error_band_95):
+                        label = f"{class_name} {conf:.2f} | {fire_range_m:.2f} m ±{error_band_95:.1f}"
+                    else:
+                        label = f"{class_name} {conf:.2f} | {fire_range_m:.2f} m"
                 else:
-                    label = f"{class_name} {conf:.2f} | depth=nan"
+                    label = f"{class_name} {conf:.2f} | range=nan"
 
                 cv2.rectangle(debug_left, (x1, y1), (x2, y2), (0, 255, 0), 2)
                 cv2.circle(debug_left, (bx, by), 5, (0, 165, 255), -1)
@@ -330,10 +367,11 @@ class LustraApp:
                     print(
                         f"[YOLO] #{det_i} {class_name} conf={conf:.2f} "
                         f"bbox=({x1},{y1},{x2},{y2}) center=({bx},{by}) "
-                        f"depth={fire_depth:.2f} m"
-                        if np.isfinite(fire_depth)
+                        f"range={fire_range_m:.2f} m"
+                        + (f" | 95% abs err ±{error_band_95:.2f} m" if np.isfinite(error_band_95) else "")
+                        if np.isfinite(fire_range_m)
                         else f"[YOLO] #{det_i} {class_name} conf={conf:.2f} "
-                        f"bbox=({x1},{y1},{x2},{y2}) center=({bx},{by}) depth=nan"
+                        f"bbox=({x1},{y1},{x2},{y2}) center=({bx},{by}) range=nan"
                     )
 
             self.process_click(debug_left, depth_m)

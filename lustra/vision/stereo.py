@@ -7,17 +7,17 @@ class StereoProcessor:
         self.fx = fx
         self.baseline_m = baseline_m
         self.num_disp = 16 * 12
-        self.block_size = 7
+        self.block_size = 5
         self.stereo = cv2.StereoSGBM_create(
             minDisparity=0,
             numDisparities=self.num_disp,
             blockSize=self.block_size,
             P1=8 * self.block_size * self.block_size,
             P2=32 * self.block_size * self.block_size,
-            disp12MaxDiff=1,
-            uniquenessRatio=5,
-            speckleWindowSize=150,
-            speckleRange=1,
+            disp12MaxDiff=2,
+            uniquenessRatio=10,
+            speckleWindowSize=100,
+            speckleRange=2,
             preFilterCap=31,
             mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY,
         )
@@ -26,11 +26,12 @@ class StereoProcessor:
         gray_left = cv2.cvtColor(img_left, cv2.COLOR_BGR2GRAY)
         gray_right = cv2.cvtColor(img_right, cv2.COLOR_BGR2GRAY)
 
-        noise = np.random.normal(0, 2, gray_left.shape).astype(np.int16)
-        gray_left = np.clip(gray_left.astype(np.int16) + noise, 0, 255).astype(np.uint8)
-        gray_right = np.clip(gray_right.astype(np.int16) + noise, 0, 255).astype(np.uint8)
-
-        disp = self.stereo.compute(gray_left, gray_right).astype(np.float32) / 16.0
+        gray_left = cv2.GaussianBlur(gray_left, (3, 3), 0)
+        gray_right = cv2.GaussianBlur(gray_right, (3, 3), 0)
+        disp_raw = self.stereo.compute(gray_left, gray_right).astype(np.float32) / 16.0
+        valid_mask = disp_raw > 0.5
+        disp_filtered = cv2.bilateralFilter(np.where(valid_mask, disp_raw, 0.0), 5, 10, 10)
+        disp = np.where(valid_mask, disp_filtered, np.nan)
         disp[disp <= 0.5] = np.nan
 
         depth_m = (self.fx * self.baseline_m) / disp
@@ -61,4 +62,3 @@ class StereoProcessor:
         if len(vals) == 0:
             return np.nan
         return float(np.median(vals))
-
