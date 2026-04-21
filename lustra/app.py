@@ -20,8 +20,11 @@ os.environ["KMP_WARNINGS"] = "0"
 
 
 class LustraApp:
-    def __init__(self):
+    def __init__(self, verbose=False):
         print("[startup] Initializing Lustra app...", flush=True)
+        self.verbose = bool(verbose)
+        self.left_window_name = "Left Eye (Reference)"
+        self.default_window_name = "Lustra (Default View)"
         self.paths = get_project_paths()
         os.makedirs(self.paths.captured_images_dir, exist_ok=True)
 
@@ -70,6 +73,10 @@ class LustraApp:
         self.current_left_seg_mask = None
         self._init_depth_compare_csv()
 
+    def _show_clean_window(self, name, image):
+        cv2.namedWindow(name, cv2.WINDOW_NORMAL | cv2.WINDOW_GUI_NORMAL)
+        cv2.imshow(name, image)
+
     def _load_detector_worker(self):
         try:
             print("[startup] Importing YOLO runtime...", flush=True)
@@ -92,7 +99,10 @@ class LustraApp:
 
     def setup_simulation(self):
         print("[startup] Connecting to PyBullet GUI...", flush=True)
-        p.connect(p.GUI, options="--disable-example-browser")
+        if self.verbose:
+            p.connect(p.GUI, options="--disable-example-browser")
+        else:
+            p.connect(p.DIRECT)
         p.setInternalSimFlags(0)
         p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0)
         p.configureDebugVisualizer(p.COV_ENABLE_SEGMENTATION_MARK_PREVIEW, 0)
@@ -119,6 +129,7 @@ class LustraApp:
 
     def print_controls(self):
         print("Intrinsics:", "fx=", self.fx, "fy=", self.fy, "cx=", self.cx, "cy=", self.cy)
+        print("Mode:", "VERBOSE (-v)" if self.verbose else "DEFAULT")
         print("------ Drone Controls -----")
         print("Press 'w' to move forwards.")
         print("Press 'x' to move backwards.")
@@ -247,7 +258,7 @@ class LustraApp:
         return float(np.percentile(np.array(self.clicked_abs_errors_m, dtype=np.float32), percentile))
 
     def make_depth_comparison_panel(self):
-        panel_h, panel_w = 360, 640
+        panel_h, panel_w = 430, 640
         panel = np.full((panel_h, panel_w, 3), 22, dtype=np.uint8)
         cv2.putText(panel, "Depth Comparison", (20, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (200, 220, 255), 2)
 
@@ -274,7 +285,10 @@ class LustraApp:
             cv2.putText(panel, line, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (235, 235, 235), 1)
             y += 26
 
-        x0, y0, w, h = 20, 180, 600, 160
+        x0 = 20
+        y0 = y + 8
+        w = panel_w - 40
+        h = max(90, panel_h - y0 - 18)
         cv2.rectangle(panel, (x0, y0), (x0 + w, y0 + h), (120, 120, 120), 1)
         tail = abs_errors[-200:]
         if len(tail) >= 2:
@@ -296,6 +310,53 @@ class LustraApp:
         if event == cv2.EVENT_LBUTTONDOWN:
             self.clicked_point = (x, y)
             print(f"Clicked pixel: ({x}, {y})")
+
+    def on_mouse_default_view(self, event, x, y, flags, param):
+        del param
+        if event == cv2.EVENT_LBUTTONDOWN and 0 <= x < self.width and 0 <= y < self.height:
+            self.on_mouse(event, x, y, flags, None)
+
+    def make_default_view_panel(self, debug_left, topdown_map):
+        depth_panel = self.make_depth_comparison_panel()
+        left_h, left_w = debug_left.shape[:2]
+        right_w = left_w
+        v_spacer = np.full((left_h, 8, 3), 35, dtype=np.uint8)
+        h_spacer = np.full((8, right_w, 3), 35, dtype=np.uint8)
+
+        top_h = int((left_h - 8) * 0.40)
+        bottom_h = left_h - 8 - top_h
+
+        top_block = np.full((top_h, right_w, 3), 18, dtype=np.uint8)
+        pad = 10
+        map_w = int(right_w * 0.52)
+        map_h = max(80, top_h - (2 * pad))
+        topdown_resized = cv2.resize(topdown_map, (map_w, map_h), interpolation=cv2.INTER_LINEAR)
+        top_block[pad : pad + map_h, pad : pad + map_w] = topdown_resized
+
+        controls = [
+            "Controls",
+            "W/X: forward/back",
+            "A/D: left/right",
+            "R/F: up/down",
+            "C: save ground point",
+            "T: save images",
+            "Q: quit",
+        ]
+        text_y = 24
+        for i, line in enumerate(controls):
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            scale = 0.56 if i == 0 else 0.45
+            color = (220, 230, 255) if i == 0 else (220, 220, 220)
+            thickness = 2 if i == 0 else 1
+            (tw, th), _ = cv2.getTextSize(line, font, scale, thickness)
+            tx = max(map_w + 2 * pad, right_w - pad - tw)
+            cv2.putText(top_block, line, (tx, text_y), font, scale, color, thickness)
+            text_y += th + (8 if i == 0 else 7)
+
+        depth_resized = cv2.resize(depth_panel, (right_w, bottom_h), interpolation=cv2.INTER_LINEAR)
+        right_column = np.vstack([top_block, h_spacer, depth_resized])
+
+        return np.hstack([debug_left, v_spacer, right_column])
 
     def project_bbox_corners_to_ground(self, x1, y1, x2, y2):
         corners_img = [
@@ -387,9 +448,39 @@ class LustraApp:
             self.base_eye_pos[2] -= self.move_speed
             self.cam_target[2] -= self.move_speed
 
+    def handle_movement_key(self, key_code):
+        if key_code < 0:
+            return
+
+        _, right, _ = get_camera_basis(self.base_eye_pos, self.cam_target, self.cam_up)
+        raw_forward = self.cam_target - self.base_eye_pos
+        forward_horizontal = np.array([raw_forward[0], raw_forward[1], 0])
+        if np.linalg.norm(forward_horizontal) > 0:
+            forward_horizontal /= np.linalg.norm(forward_horizontal)
+
+        if key_code == ord("w"):
+            self.base_eye_pos += forward_horizontal * self.move_speed
+            self.cam_target += forward_horizontal * self.move_speed
+        elif key_code == ord("x"):
+            self.base_eye_pos -= forward_horizontal * self.move_speed
+            self.cam_target -= forward_horizontal * self.move_speed
+        elif key_code == ord("a"):
+            self.base_eye_pos -= right * self.move_speed
+            self.cam_target -= right * self.move_speed
+        elif key_code == ord("d"):
+            self.base_eye_pos += right * self.move_speed
+            self.cam_target += right * self.move_speed
+        elif key_code == ord("r"):
+            self.base_eye_pos[2] += self.move_speed
+            self.cam_target[2] += self.move_speed
+        elif key_code == ord("f"):
+            self.base_eye_pos[2] -= self.move_speed
+            self.cam_target[2] -= self.move_speed
+
     def handle_save(self, keys, debug_left, img_right, depth_vis_u8, disp_vis_u8):
+        active_window = self.left_window_name if self.verbose else self.default_window_name
         if ord("t") not in keys or not (keys[ord("t")] & p.KEY_WAS_TRIGGERED):
-            cv2.setWindowTitle("Left Eye (Reference)", "Left Eye (Reference)")
+            cv2.setWindowTitle(active_window, active_window)
             return
 
         l_filename = os.path.join(self.paths.captured_images_dir, f"rect_left_{self.img_counter}.png")
@@ -407,7 +498,7 @@ class LustraApp:
         print("Right:", r_filename)
         print("Depth:", d_filename)
         print("Disp :", s_filename)
-        cv2.setWindowTitle("Left Eye (Reference)", "SAVED! - SAVED! - SAVED!")
+        cv2.setWindowTitle(active_window, "SAVED! - SAVED! - SAVED!")
         self.img_counter += 1
 
     def run(self):
@@ -418,12 +509,16 @@ class LustraApp:
         self._start_detector_loading()
 
         while True:
+            key_pressed = cv2.waitKey(1) & 0xFF
             p.stepSimulation()
             keys = p.getKeyboardEvents()
 
-            self.handle_movement(keys)
+            if self.verbose:
+                self.handle_movement(keys)
+            else:
+                self.handle_movement_key(key_pressed)
 
-            if ord("g") in keys and keys[ord("g")] & p.KEY_WAS_TRIGGERED:
+            if (self.verbose and ord("g") in keys and keys[ord("g")] & p.KEY_WAS_TRIGGERED) or (not self.verbose and key_pressed == ord("g")):
                 self.show_stereo = not self.show_stereo
 
             left_eye, right_eye, left_target, right_target = get_parallel_stereo_views(
@@ -530,7 +625,7 @@ class LustraApp:
 
             self.process_click(debug_left, depth_m)
 
-            if ord("c") in keys and keys[ord("c")] & p.KEY_WAS_TRIGGERED:
+            if (self.verbose and ord("c") in keys and keys[ord("c")] & p.KEY_WAS_TRIGGERED) or (not self.verbose and key_pressed == ord("c")):
                 if self.clicked_ground_point is not None:
                     self.saved_ground_points.append(
                         {
@@ -554,10 +649,6 @@ class LustraApp:
             cv2.circle(debug_left, (320, 240), 5, (255, 0, 255), -1)
             cv2.circle(debug_left, (380, 280), 5, (255, 255, 0), -1)
 
-            cv2.imshow("Left Eye (Reference)", debug_left)
-            cv2.setMouseCallback("Left Eye (Reference)", self.on_mouse)
-            cv2.imshow("Right Eye (Shifted)", img_right)
-
             topdown = draw_topdown_map(
                 drone_pos=self.base_eye_pos,
                 target_pos=self.cam_target,
@@ -567,16 +658,44 @@ class LustraApp:
                 map_size_px=800,
                 world_half_extent=80.0,
             )
-            cv2.imshow("Top-Down Map", topdown)
-            cv2.imshow("Depth Comparison", self.make_depth_comparison_panel())
 
-            if self.show_stereo:
-                cv2.imshow("Disparity", disp_vis_u8)
-                cv2.imshow("Depth (0-80m, invalid=white)", depth_vis_u8)
+            if self.verbose:
+                self._show_clean_window(self.left_window_name, debug_left)
+                cv2.setMouseCallback(self.left_window_name, self.on_mouse)
+                self._show_clean_window("Right Eye (Shifted)", img_right)
+                self._show_clean_window("Top-Down Map", topdown)
+                self._show_clean_window("Depth Comparison", self.make_depth_comparison_panel())
+            else:
+                default_panel = self.make_default_view_panel(debug_left, topdown)
+                self._show_clean_window(self.default_window_name, default_panel)
+                cv2.setMouseCallback(self.default_window_name, self.on_mouse_default_view)
+
+            if self.verbose and self.show_stereo:
+                self._show_clean_window("Disparity", disp_vis_u8)
+                self._show_clean_window("Depth (0-80m, invalid=white)", depth_vis_u8)
 
             self.handle_save(keys, debug_left, img_right, depth_vis_u8, disp_vis_u8)
 
-            if (ord("q") in keys) or (cv2.waitKey(1) & 0xFF == ord("q")):
+            if (not self.verbose) and key_pressed == ord("t"):
+                l_filename = os.path.join(self.paths.captured_images_dir, f"rect_left_{self.img_counter}.png")
+                r_filename = os.path.join(self.paths.captured_images_dir, f"rect_right_{self.img_counter}.png")
+                d_filename = os.path.join(self.paths.captured_images_dir, f"depth_vis_{self.img_counter}.png")
+                s_filename = os.path.join(self.paths.captured_images_dir, f"disp_vis_{self.img_counter}.png")
+
+                cv2.imwrite(l_filename, debug_left)
+                cv2.imwrite(r_filename, img_right)
+                cv2.imwrite(d_filename, depth_vis_u8)
+                cv2.imwrite(s_filename, disp_vis_u8)
+
+                print(f"!!! SUCCESS !!! Saved set {self.img_counter}")
+                print("Left :", l_filename)
+                print("Right:", r_filename)
+                print("Depth:", d_filename)
+                print("Disp :", s_filename)
+                cv2.setWindowTitle(self.default_window_name, "SAVED! - SAVED! - SAVED!")
+                self.img_counter += 1
+
+            if (self.verbose and (ord("q") in keys)) or (key_pressed == ord("q")):
                 break
 
             time.sleep(1 / 240)
