@@ -29,8 +29,11 @@ class LustraApp:
         os.makedirs(self.paths.captured_images_dir, exist_ok=True)
 
         self.clicked_point = None
+        self.pending_click_point = None
         self.clicked_ground_point = None
         self.clicked_depth_value = None
+        self.clicked_range_value = None
+        self.clicked_error_band_value = np.nan
         self.saved_ground_points = []
 
         self.width, self.height = 640, 640
@@ -71,11 +74,18 @@ class LustraApp:
         self.current_left_target = self.cam_target.copy()
         self.current_left_depth_m = None
         self.current_left_seg_mask = None
+        self._default_move_key = None
+        self._default_move_ttl_s = 0.18
+        self._default_move_last_seen = 0.0
         self._init_depth_compare_csv()
 
     def _show_clean_window(self, name, image):
         cv2.namedWindow(name, cv2.WINDOW_NORMAL | cv2.WINDOW_GUI_NORMAL)
         cv2.imshow(name, image)
+
+    def _show_default_window(self, image):
+        cv2.namedWindow(self.default_window_name, cv2.WINDOW_AUTOSIZE)
+        cv2.imshow(self.default_window_name, image)
 
     def _load_detector_worker(self):
         try:
@@ -308,7 +318,7 @@ class LustraApp:
     def on_mouse(self, event, x, y, flags, param):
         del flags, param
         if event == cv2.EVENT_LBUTTONDOWN:
-            self.clicked_point = (x, y)
+            self.pending_click_point = (x, y)
             print(f"Clicked pixel: ({x}, {y})")
 
     def on_mouse_default_view(self, event, x, y, flags, param):
@@ -376,36 +386,42 @@ class LustraApp:
         return ground_pts
 
     def process_click(self, debug_left, depth_m):
+        if self.pending_click_point is not None:
+            self.clicked_point = self.pending_click_point
+            self.pending_click_point = None
+            px, py = self.clicked_point
+            z_click = self.stereo_processor.patch_median_depth(depth_m, px, py, half_size=8)
+            self.clicked_depth_value = z_click
+            click_range_m = self.compute_range_from_depth(z_click, px, py)
+            self.clicked_range_value = click_range_m
+            comparison = self.build_clicked_comparison(click_range_m, self.current_left_eye, self.frame_i, px, py)
+            if comparison is not None:
+                self.last_clicked_comparison = comparison
+                self.append_clicked_comparison_to_csv(comparison)
+            self.clicked_error_band_value = self.get_clicked_error_band(percentile=95)
+
+            ray_cam = pixel_to_camera_ray(px, py, self.fx, self.fy, self.cx, self.cy)
+            ray_world = camera_ray_to_world(ray_cam, self.current_left_eye, self.current_left_target, self.cam_up)
+            ground_pt = intersect_ray_with_ground(self.current_left_eye, ray_world, ground_z=0.0)
+            self.clicked_ground_point = ground_pt
+
+            if self.clicked_ground_point is not None:
+                print(
+                    f"Clicked depth: {z_click:.2f} m" if np.isfinite(z_click) else "Clicked depth: nan",
+                    f"| Ground point: ({self.clicked_ground_point[0]:.2f}, {ground_pt[1]:.2f}, {ground_pt[2]:.2f})",
+                )
+
         if self.clicked_point is None:
             return
 
         px, py = self.clicked_point
-        z_click = self.stereo_processor.patch_median_depth(depth_m, px, py, half_size=8)
-        self.clicked_depth_value = z_click
-        click_range_m = self.compute_range_from_depth(z_click, px, py)
-        comparison = self.build_clicked_comparison(click_range_m, self.current_left_eye, self.frame_i, px, py)
-        if comparison is not None:
-            self.last_clicked_comparison = comparison
-            self.append_clicked_comparison_to_csv(comparison)
-        error_band_95 = self.get_clicked_error_band(percentile=95)
-
-        ray_cam = pixel_to_camera_ray(px, py, self.fx, self.fy, self.cx, self.cy)
-        ray_world = camera_ray_to_world(ray_cam, self.current_left_eye, self.current_left_target, self.cam_up)
-        ground_pt = intersect_ray_with_ground(self.current_left_eye, ray_world, ground_z=0.0)
-        self.clicked_ground_point = ground_pt
-
-        if self.frame_i % 5 == 0 and self.clicked_ground_point is not None:
-            print(
-                f"Clicked depth: {z_click:.2f} m" if np.isfinite(z_click) else "Clicked depth: nan",
-                f"| Ground point: ({self.clicked_ground_point[0]:.2f}, {ground_pt[1]:.2f}, {ground_pt[2]:.2f})",
-            )
 
         cv2.circle(debug_left, (px, py), 7, (0, 0, 255), -1)
-        if np.isfinite(click_range_m):
-            if np.isfinite(error_band_95):
-                depth_label = f"{click_range_m:.2f} m ±{error_band_95:.1f}"
+        if np.isfinite(self.clicked_range_value):
+            if np.isfinite(self.clicked_error_band_value):
+                depth_label = f"{self.clicked_range_value:.2f} m ±{self.clicked_error_band_value:.1f}"
             else:
-                depth_label = f"{click_range_m:.2f} m"
+                depth_label = f"{self.clicked_range_value:.2f} m"
         else:
             depth_label = "nan"
         cv2.putText(debug_left, depth_label, (px + 10, py - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
@@ -449,7 +465,18 @@ class LustraApp:
             self.cam_target[2] -= self.move_speed
 
     def handle_movement_key(self, key_code):
-        if key_code < 0:
+        now = time.time()
+        move_keys = {ord("w"), ord("x"), ord("a"), ord("d"), ord("r"), ord("f")}
+        if key_code in move_keys:
+            self._default_move_key = key_code
+            self._default_move_last_seen = now
+        elif key_code == -1 and self._default_move_key is not None:
+            if now - self._default_move_last_seen > self._default_move_ttl_s:
+                self._default_move_key = None
+        elif key_code >= 0:
+            self._default_move_key = None
+
+        if self._default_move_key is None:
             return
 
         _, right, _ = get_camera_basis(self.base_eye_pos, self.cam_target, self.cam_up)
@@ -458,22 +485,22 @@ class LustraApp:
         if np.linalg.norm(forward_horizontal) > 0:
             forward_horizontal /= np.linalg.norm(forward_horizontal)
 
-        if key_code == ord("w"):
+        if self._default_move_key == ord("w"):
             self.base_eye_pos += forward_horizontal * self.move_speed
             self.cam_target += forward_horizontal * self.move_speed
-        elif key_code == ord("x"):
+        elif self._default_move_key == ord("x"):
             self.base_eye_pos -= forward_horizontal * self.move_speed
             self.cam_target -= forward_horizontal * self.move_speed
-        elif key_code == ord("a"):
+        elif self._default_move_key == ord("a"):
             self.base_eye_pos -= right * self.move_speed
             self.cam_target -= right * self.move_speed
-        elif key_code == ord("d"):
+        elif self._default_move_key == ord("d"):
             self.base_eye_pos += right * self.move_speed
             self.cam_target += right * self.move_speed
-        elif key_code == ord("r"):
+        elif self._default_move_key == ord("r"):
             self.base_eye_pos[2] += self.move_speed
             self.cam_target[2] += self.move_speed
-        elif key_code == ord("f"):
+        elif self._default_move_key == ord("f"):
             self.base_eye_pos[2] -= self.move_speed
             self.cam_target[2] -= self.move_speed
 
@@ -550,16 +577,6 @@ class LustraApp:
                 self.far_val,
             )
 
-            if self._detector_ready:
-                detections = self.detector.detect(img_left, self.width, self.height, conf_thres=self.conf_threshold)
-            else:
-                detections = []
-                if self._detector_error is not None and not self._detector_wait_printed:
-                    print("[startup] Continuing without YOLO detections.", flush=True)
-                    self._detector_wait_printed = True
-                elif self._detector_error is None and not self._detector_wait_printed:
-                    print("[startup] Waiting for YOLO to finish loading...", flush=True)
-                    self._detector_wait_printed = True
             disp, depth_m, valid_ratio, disp_vis_u8, depth_vis_u8 = self.stereo_processor.compute_depth_and_visuals(img_left, img_right)
 
             if self.frame_i % 30 == 0:
@@ -583,6 +600,18 @@ class LustraApp:
 
             self.frame_i += 1
             debug_left = img_left.copy()
+            self.process_click(debug_left, depth_m)
+
+            if self._detector_ready:
+                detections = self.detector.detect(img_left, self.width, self.height, conf_thres=self.conf_threshold)
+            else:
+                detections = []
+                if self._detector_error is not None and not self._detector_wait_printed:
+                    print("[startup] Continuing without YOLO detections.", flush=True)
+                    self._detector_wait_printed = True
+                elif self._detector_error is None and not self._detector_wait_printed:
+                    print("[startup] Waiting for YOLO to finish loading...", flush=True)
+                    self._detector_wait_printed = True
             yolo_ground_polygons = []
 
             for det_i, det in enumerate(detections):
@@ -622,8 +651,6 @@ class LustraApp:
                         else f"[YOLO] #{det_i} {class_name} conf={conf:.2f} "
                         f"bbox=({x1},{y1},{x2},{y2}) center=({bx},{by}) range=nan"
                     )
-
-            self.process_click(debug_left, depth_m)
 
             if (self.verbose and ord("c") in keys and keys[ord("c")] & p.KEY_WAS_TRIGGERED) or (not self.verbose and key_pressed == ord("c")):
                 if self.clicked_ground_point is not None:
@@ -667,7 +694,7 @@ class LustraApp:
                 self._show_clean_window("Depth Comparison", self.make_depth_comparison_panel())
             else:
                 default_panel = self.make_default_view_panel(debug_left, topdown)
-                self._show_clean_window(self.default_window_name, default_panel)
+                self._show_default_window(default_panel)
                 cv2.setMouseCallback(self.default_window_name, self.on_mouse_default_view)
 
             if self.verbose and self.show_stereo:
