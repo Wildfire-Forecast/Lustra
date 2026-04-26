@@ -77,7 +77,29 @@ class LustraApp:
         self._default_move_key = None
         self._default_move_ttl_s = 0.18
         self._default_move_last_seen = 0.0
+        self.controls_panel = self.make_controls_panel()
         self._init_depth_compare_csv()
+
+    def make_controls_panel(self):
+        panel = np.full((260, 420, 3), 18, dtype=np.uint8)
+        lines = [
+            "Controls",
+            "W/X: forward/back",
+            "A/D: left/right",
+            "R/F: up/down",
+            "C: save ground point",
+            "T: save images",
+            "G: stereo windows (verbose)",
+            "Q: quit",
+        ]
+        y = 34
+        for i, line in enumerate(lines):
+            scale = 0.75 if i == 0 else 0.58
+            color = (220, 230, 255) if i == 0 else (225, 225, 225)
+            thickness = 2 if i == 0 else 1
+            cv2.putText(panel, line, (18, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness)
+            y += 34 if i == 0 else 28
+        return panel
 
     def _show_clean_window(self, name, image):
         cv2.namedWindow(name, cv2.WINDOW_NORMAL | cv2.WINDOW_GUI_NORMAL)
@@ -109,10 +131,7 @@ class LustraApp:
 
     def setup_simulation(self):
         print("[startup] Connecting to PyBullet GUI...", flush=True)
-        if self.verbose:
-            p.connect(p.GUI, options="--disable-example-browser")
-        else:
-            p.connect(p.DIRECT)
+        p.connect(p.GUI, options="--disable-example-browser")
         p.setInternalSimFlags(0)
         p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0)
         p.configureDebugVisualizer(p.COV_ENABLE_SEGMENTATION_MARK_PREVIEW, 0)
@@ -537,15 +556,13 @@ class LustraApp:
 
         while True:
             key_pressed = cv2.waitKey(1) & 0xFF
+            del key_pressed
             p.stepSimulation()
             keys = p.getKeyboardEvents()
 
-            if self.verbose:
-                self.handle_movement(keys)
-            else:
-                self.handle_movement_key(key_pressed)
+            self.handle_movement(keys)
 
-            if (self.verbose and ord("g") in keys and keys[ord("g")] & p.KEY_WAS_TRIGGERED) or (not self.verbose and key_pressed == ord("g")):
+            if ord("g") in keys and keys[ord("g")] & p.KEY_WAS_TRIGGERED:
                 self.show_stereo = not self.show_stereo
 
             left_eye, right_eye, left_target, right_target = get_parallel_stereo_views(
@@ -652,7 +669,7 @@ class LustraApp:
                         f"bbox=({x1},{y1},{x2},{y2}) center=({bx},{by}) range=nan"
                     )
 
-            if (self.verbose and ord("c") in keys and keys[ord("c")] & p.KEY_WAS_TRIGGERED) or (not self.verbose and key_pressed == ord("c")):
+            if ord("c") in keys and keys[ord("c")] & p.KEY_WAS_TRIGGERED:
                 if self.clicked_ground_point is not None:
                     self.saved_ground_points.append(
                         {
@@ -703,26 +720,7 @@ class LustraApp:
 
             self.handle_save(keys, debug_left, img_right, depth_vis_u8, disp_vis_u8)
 
-            if (not self.verbose) and key_pressed == ord("t"):
-                l_filename = os.path.join(self.paths.captured_images_dir, f"rect_left_{self.img_counter}.png")
-                r_filename = os.path.join(self.paths.captured_images_dir, f"rect_right_{self.img_counter}.png")
-                d_filename = os.path.join(self.paths.captured_images_dir, f"depth_vis_{self.img_counter}.png")
-                s_filename = os.path.join(self.paths.captured_images_dir, f"disp_vis_{self.img_counter}.png")
-
-                cv2.imwrite(l_filename, debug_left)
-                cv2.imwrite(r_filename, img_right)
-                cv2.imwrite(d_filename, depth_vis_u8)
-                cv2.imwrite(s_filename, disp_vis_u8)
-
-                print(f"!!! SUCCESS !!! Saved set {self.img_counter}")
-                print("Left :", l_filename)
-                print("Right:", r_filename)
-                print("Depth:", d_filename)
-                print("Disp :", s_filename)
-                cv2.setWindowTitle(self.default_window_name, "SAVED! - SAVED! - SAVED!")
-                self.img_counter += 1
-
-            if (self.verbose and (ord("q") in keys)) or (key_pressed == ord("q")):
+            if ord("q") in keys:
                 break
 
             time.sleep(1 / 240)
