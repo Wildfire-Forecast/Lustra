@@ -147,9 +147,9 @@ Lustra explores how **computer vision and AI systems can assist wildfire monitor
 # Authors
 
 ```
-**Aras Fırat**
-**Berat Bora Altaș**
-**Tunda Demirci**
+Aras Fırat
+Berat Bora Altaș
+Tunda Demirci
 ```
 
 
