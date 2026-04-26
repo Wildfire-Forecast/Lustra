@@ -483,21 +483,6 @@ class LustraApp:
             self.base_eye_pos[2] -= self.move_speed
             self.cam_target[2] -= self.move_speed
 
-    def handle_movement_key(self, key_code):
-        now = time.time()
-        move_keys = {ord("w"), ord("x"), ord("a"), ord("d"), ord("r"), ord("f")}
-        if key_code in move_keys:
-            self._default_move_key = key_code
-            self._default_move_last_seen = now
-        elif key_code == -1 and self._default_move_key is not None:
-            if now - self._default_move_last_seen > self._default_move_ttl_s:
-                self._default_move_key = None
-        elif key_code >= 0:
-            self._default_move_key = None
-
-        if self._default_move_key is None:
-            return
-
         _, right, _ = get_camera_basis(self.base_eye_pos, self.cam_target, self.cam_up)
         raw_forward = self.cam_target - self.base_eye_pos
         forward_horizontal = np.array([raw_forward[0], raw_forward[1], 0])

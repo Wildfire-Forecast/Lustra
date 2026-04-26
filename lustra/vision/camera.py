@@ -4,14 +4,6 @@ import pybullet as p
 
 from .geometry import get_camera_basis
 
-
-def get_stereo_eyes(base_eye_pos, cam_target, cam_up, baseline_m):
-    _, right, _ = get_camera_basis(base_eye_pos, cam_target, cam_up)
-    left_eye = base_eye_pos - right * (baseline_m / 2.0)
-    right_eye = base_eye_pos + right * (baseline_m / 2.0)
-    return left_eye, right_eye
-
-
 def get_parallel_stereo_views(base_eye_pos, cam_target, cam_up, baseline_m):
     forward, right, _ = get_camera_basis(base_eye_pos, cam_target, cam_up)
     left_eye = base_eye_pos - right * (baseline_m / 2.0)
