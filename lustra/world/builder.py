@@ -110,6 +110,7 @@ class WorldBuilder:
                 "tree": [{"file": "trunk.png", "keywords": [""]}],
                 "rock": [{"file": "rock.png", "keywords": [""]}],
                 "bush": [{"file": "bush.png", "keywords": [""]}],
+                "fire": [{"file": "fire.png", "keywords": [""]}]
             }
 
             active_rule = next((rules for key, rules in texture_rules.items() if key in base_name), None)
