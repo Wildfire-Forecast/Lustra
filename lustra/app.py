@@ -20,9 +20,10 @@ os.environ["KMP_WARNINGS"] = "0"
 
 
 class LustraApp:
-    def __init__(self, verbose=False):
+    def __init__(self, verbose=False, drone_height_m=18.0):
         print("[startup] Initializing Lustra app...", flush=True)
         self.verbose = bool(verbose)
+        self.drone_height_m = float(drone_height_m)
         self.left_window_name = "Left Eye (Reference)"
         self.default_window_name = "Lustra (Default View)"
         self.paths = get_project_paths()
@@ -40,10 +41,9 @@ class LustraApp:
         self.fov = 60
         self.near_val, self.far_val = 0.1, 120.0
 
-        cam_height = 18.0
         self.cam_up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
         self.cam_target = np.array([8.0, 8.0, 0.0], dtype=np.float32)
-        self.base_eye_pos = np.array([20.0, 20.0, cam_height], dtype=np.float32)
+        self.base_eye_pos = np.array([20.0, 20.0, self.drone_height_m], dtype=np.float32)
         self.baseline_m = 0.30
 
         self.cx = self.width / 2.0
@@ -159,6 +159,7 @@ class LustraApp:
     def print_controls(self):
         print("Intrinsics:", "fx=", self.fx, "fy=", self.fy, "cx=", self.cx, "cy=", self.cy)
         print("Mode:", "VERBOSE (-v)" if self.verbose else "DEFAULT")
+        print(f"Drone height (m): {self.drone_height_m:.2f}")
         print("------ Drone Controls -----")
         print("Press 'w' to move forwards.")
         print("Press 'x' to move backwards.")
@@ -302,7 +303,7 @@ class LustraApp:
         p95_err = self.get_clicked_error_band(95)
 
         stats_lines = [
-            f"Pixel: ({c['pixel_x']}, {c['pixel_y']}) | Hit body: {c['hit_body_id']}",
+            f"Pixel: ({c['pixel_x']}, {c['pixel_y']}) | Hit body: {c['hit_body_id']}) | Drone height: {self.drone_height_m:.2f} m",
             f"Estimated range: {c['estimated_range_m']:.2f} m",
             f"True range:      {c['true_range_m']:.2f} m",
             f"Abs error:       {c['abs_error_m']:.2f} m",
@@ -482,6 +483,7 @@ class LustraApp:
         if ord("f") in keys and keys[ord("f")] & p.KEY_IS_DOWN:
             self.base_eye_pos[2] -= self.move_speed
             self.cam_target[2] -= self.move_speed
+        self.drone_height_m = float(self.base_eye_pos[2])
 
         _, right, _ = get_camera_basis(self.base_eye_pos, self.cam_target, self.cam_up)
         raw_forward = self.cam_target - self.base_eye_pos
@@ -507,6 +509,7 @@ class LustraApp:
         elif self._default_move_key == ord("f"):
             self.base_eye_pos[2] -= self.move_speed
             self.cam_target[2] -= self.move_speed
+        self.drone_height_m = float(self.base_eye_pos[2])
 
     def handle_save(self, keys, debug_left, img_right, depth_vis_u8, disp_vis_u8):
         active_window = self.left_window_name if self.verbose else self.default_window_name

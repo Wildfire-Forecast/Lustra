@@ -8,7 +8,13 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Run Lustra app")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose mode and show all windows")
+    parser.add_argument(
+        "--drone-height-m",
+        type=float,
+        default=18.0,
+        help="Initial drone height in meters",
+    )
     args = parser.parse_args()
 
     print("[boot] Starting app...", flush=True)
-    LustraApp(verbose=args.verbose).run()
+    LustraApp(verbose=args.verbose, drone_height_m=args.drone_height_m).run()
