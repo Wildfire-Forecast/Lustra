@@ -134,18 +134,20 @@ class WorldBuilder:
             print(f"Error loading {urdf_filename}: {e}")
             return None
 
-    def spawn_fire(self, center_pos, offset=1.5):
-        plus_offsets = [
-            [0, 0],           
-            [offset, 0],      
-            [-offset, 0],     
-            [0, offset],      
-            [0, -offset]      
-        ]
-        
+    def spawn_fire(self, center_pos, num_fires=10, max_radius=50):
         spawned_ids = []
         
-        for dx, dy in plus_offsets:
+        first_fire = self.spawn_asset_by_type("fire", center_pos)
+        if first_fire is not None:
+            spawned_ids.append(first_fire)
+
+        for _ in range(num_fires - 1):
+            angle = random.uniform(0, 2 * math.pi)
+            r = random.uniform(0.5, max_radius)
+            
+            dx = r * math.cos(angle)
+            dy = r * math.sin(angle)
+            
             spawn_pos = [center_pos[0] + dx, center_pos[1] + dy, center_pos[2]]
             
             fire_id = self.spawn_asset_by_type("fire", spawn_pos)
