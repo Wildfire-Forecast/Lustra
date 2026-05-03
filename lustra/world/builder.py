@@ -82,8 +82,9 @@ class WorldBuilder:
                         if roll < 0.05:
                             self.spawn_asset_by_type("tree", [wx, wy, 0])
                         else:
-                            asset = random.choice(["rock", "bush"])
-                            self.spawn_asset_by_type(asset, [wx, wy, 0])
+                            asset = random.choice(["rock", "tree"])
+                            s = 0.2 if asset == "tree" else 1.0
+                            self.spawn_asset_by_type(asset, [wx, wy, 0], scale=s)
 
         p.configureDebugVisualizer(p.COV_ENABLE_RENDERING, 1)
 

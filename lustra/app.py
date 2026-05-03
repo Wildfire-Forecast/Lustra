@@ -149,9 +149,9 @@ class LustraApp:
         wb.build_biome_world(tile_size=4, grid_range=25)
         ## fire spawner
         p.configureDebugVisualizer(p.COV_ENABLE_RENDERING, 0) ##better performance
-        self.fire_body_id = wb.spawn_fire(center_pos=[25,25, 1], max_radius=0.5, max_scale=7)
-        self.fire_body_id = wb.spawn_fire(center_pos=[70,-10, 1], max_radius=0.5, max_scale=8)
-        self.fire_body_id = wb.spawn_fire(center_pos=[-50,-25, 1], max_radius=0.5, max_scale=5)
+        self.fire_body_id = wb.spawn_fire(center_pos=[25,25, 1], grid_size=7, max_radius=0.5, max_scale=7)
+        self.fire_body_id = wb.spawn_fire(center_pos=[70,-10, 1], grid_size=8, max_radius=0.5, max_scale=8)
+        self.fire_body_id = wb.spawn_fire(center_pos=[-50,-25, 1], grid_size=6, max_radius=0.5, max_scale=5)
         p.configureDebugVisualizer(p.COV_ENABLE_RENDERING, 1)
 
         p.resetDebugVisualizerCamera(
