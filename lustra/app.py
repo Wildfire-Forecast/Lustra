@@ -62,7 +62,7 @@ class LustraApp:
         self.stereo_processor = StereoProcessor(self.fx, self.baseline_m)
         self.conf_threshold = 0.40
 
-        self.move_speed = 0.5
+        self.move_speed = 4
         self.img_counter = 0
         self.frame_i = 0
         self.show_stereo = True
@@ -147,7 +147,12 @@ class LustraApp:
         wb = WorldBuilder(self.paths.assets_dir)
         wb.setup_base_world()
         wb.build_biome_world(tile_size=4, grid_range=25)
-        self.fire_body_id = wb.spawn_fire(center_pos=[5, 5, 1])
+        ## fire spawner
+        p.configureDebugVisualizer(p.COV_ENABLE_RENDERING, 0) ##better performance
+        self.fire_body_id = wb.spawn_fire(center_pos=[25,25, 1], max_radius=0.5, max_scale=7)
+        self.fire_body_id = wb.spawn_fire(center_pos=[70,-10, 1], max_radius=0.5, max_scale=8)
+        self.fire_body_id = wb.spawn_fire(center_pos=[-50,-25, 1], max_radius=0.5, max_scale=5)
+        p.configureDebugVisualizer(p.COV_ENABLE_RENDERING, 1)
 
         p.resetDebugVisualizerCamera(
             cameraDistance=40,

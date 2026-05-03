@@ -1,7 +1,7 @@
 import math
 import os
 import random
-
+import itertools
 import pybullet as p
 
 
@@ -13,7 +13,7 @@ class WorldBuilder:
         self.seed_x = random.uniform(0, 1000)
         self.seed_y = random.uniform(0, 1000)
 
-    def spawn_asset_by_type(self, asset_type, position):
+    def spawn_asset_by_type(self, asset_type, position, scale=1.0):
         mapping = {
             "oak": "oak/oak.urdf",
             "pinusbruita": "pinusbruita/pinusbruita.urdf",
@@ -26,7 +26,7 @@ class WorldBuilder:
         if asset_type in mapping:
             urdf_path = os.path.join(self.assets_dir, mapping[asset_type])
             rot = p.getQuaternionFromEuler([0, 0, random.uniform(0, 6.28)])
-            return self.load_custom_object(urdf_path, position=position, orientation=rot)
+            return self.load_custom_object(urdf_path, position=position, orientation=rot, scale=scale)
         return None
 
     def build_biome_world(self, tile_size=4, grid_range=20):
@@ -92,13 +92,14 @@ class WorldBuilder:
         p.setAdditionalSearchPath(self.assets_dir)
         return None
 
-    def load_custom_object(self, urdf_filename, position=[0, 0, 0], orientation=[0, 0, 0, 1]):
+    def load_custom_object(self, urdf_filename, position=[0, 0, 0], orientation=[0, 0, 0, 1],scale=1.0):
         try:
             obj_id = p.loadURDF(
                 urdf_filename,
                 basePosition=position,
                 baseOrientation=orientation,
                 useFixedBase=True,
+                globalScaling=scale
             )
 
             obj_folder = os.path.dirname(urdf_filename)
@@ -114,6 +115,7 @@ class WorldBuilder:
             }
 
             active_rule = next((rules for key, rules in texture_rules.items() if key in base_name), None)
+            p.setCollisionFilterGroupMask(obj_id, -1, 0, 0)
 
             if active_rule:
                 visual_data = p.getVisualShapeData(obj_id)
@@ -134,26 +136,26 @@ class WorldBuilder:
             print(f"Error loading {urdf_filename}: {e}")
             return None
 
-    def spawn_fire(self, center_pos, num_fires=10, max_radius=50):
+    def spawn_fire(self, center_pos, grid_size=7, max_radius=0.5, max_scale=7):
         spawned_ids = []
+        cx, cy, cz = center_pos
         
-        first_fire = self.spawn_asset_by_type("fire", center_pos)
-        if first_fire is not None:
-            spawned_ids.append(first_fire)
+        if grid_size > 1:
+            spacing = (max_radius * 2) / (grid_size - 1)
+            steps = [i * spacing - max_radius for i in range(grid_size)]
+        else:
+            steps = [0]
 
-        for _ in range(num_fires - 1):
-            angle = random.uniform(0, 2 * math.pi)
-            r = random.uniform(0.5, max_radius)
+        for dx, dy in itertools.product(steps, steps):
+            is_center = abs(dx) < 0.01 and abs(dy) < 0.01
+
+            current_scale = max_scale if is_center else random.uniform(1.0, max_scale)
+            current_z = cz + (random.random() * 0.1)
+
+            spawn_pos = [cx + dx, cy + dy, current_z]
             
-            dx = r * math.cos(angle)
-            dy = r * math.sin(angle)
-            
-            spawn_pos = [center_pos[0] + dx, center_pos[1] + dy, center_pos[2]]
-            
-            fire_id = self.spawn_asset_by_type("fire", spawn_pos)
-            
-            if fire_id is not None:
+            fire_id = self.spawn_asset_by_type("fire", spawn_pos, scale=current_scale)
+            if fire_id:
                 spawned_ids.append(fire_id)
-                
+                        
         return spawned_ids
-
