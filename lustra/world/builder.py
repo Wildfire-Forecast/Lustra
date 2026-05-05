@@ -137,7 +137,7 @@ class WorldBuilder:
             print(f"Error loading {urdf_filename}: {e}")
             return None
 
-    def spawn_fire(self, center_pos, grid_size=7, max_radius=0.5, max_scale=7):
+    def spawn_fire(self, center_pos, grid_size=7, max_radius=0.5, max_scale=20):
         spawned_ids = []
         cx, cy, cz = center_pos
         
