@@ -68,6 +68,7 @@ class LustraApp:
         self.show_stereo = True
         self.fire_body_id = None
         self.clicked_abs_errors_m = deque(maxlen=5000)
+        self.clicked_rel_errors_pct = deque(maxlen=5000)
         self.depth_compare_csv = os.path.join(self.paths.captured_images_dir, "clicked_depth_comparisons.csv")
         self.last_clicked_comparison = None
         self.current_left_eye = self.base_eye_pos.copy()
@@ -246,6 +247,7 @@ class LustraApp:
         abs_error_m = abs(pred_range_m - true_range_m)
         rel_error_pct = (abs_error_m / max(true_range_m, 1e-6)) * 100.0
         self.clicked_abs_errors_m.append(abs_error_m)
+        self.clicked_rel_errors_pct.append(rel_error_pct)
         return {
             "timestamp_unix": time.time(),
             "frame": frame_i,
@@ -320,13 +322,13 @@ class LustraApp:
             cv2.putText(panel, line, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (235, 235, 235), 1)
             y += 26
 
-        x0 = 20
-        y0 = y + 8
-        w = panel_w - 40
-        h = max(90, panel_h - y0 - 18)
-        cv2.rectangle(panel, (x0, y0), (x0 + w, y0 + h), (120, 120, 120), 1)
-        tail = abs_errors[-200:]
-        if len(tail) >= 2:
+        def draw_trend(series, x0, y0, w, h, title, unit, color):
+            cv2.rectangle(panel, (x0, y0), (x0 + w, y0 + h), (120, 120, 120), 1)
+            tail = np.array(series, dtype=np.float32)[-200:]
+            if len(tail) < 2:
+                cv2.putText(panel, f"{title}: not enough samples", (x0 + 8, y0 + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (140, 140, 140), 1)
+                return
+
             y_max = max(1.0, float(np.percentile(tail, 95)) * 1.2, float(np.max(tail)))
             prev = None
             for i, value in enumerate(tail):
@@ -334,9 +336,28 @@ class LustraApp:
                 y_plot = y0 + h - 1 - int((min(float(value), y_max) / y_max) * (h - 1))
                 point = (x, y_plot)
                 if prev is not None:
-                    cv2.line(panel, prev, point, (40, 210, 80), 2)
+                    cv2.line(panel, prev, point, color, 2)
                 prev = point
-            cv2.putText(panel, f"Abs error trend (last {len(tail)}), y-max {y_max:.1f} m", (x0 + 8, y0 + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
+            cv2.putText(
+                panel,
+                f"{title} (last {len(tail)}), y-max {y_max:.1f} {unit}",
+                (x0 + 8, y0 + 18),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (180, 180, 180),
+                1,
+            )
+
+        x0 = 20
+        y0 = y + 8
+        w = panel_w - 40
+        chart_gap = 12
+        available_h = max(120, panel_h - y0 - 18)
+        chart_h = max(55, int((available_h - chart_gap) / 2))
+        y1 = y0 + chart_h + chart_gap
+
+        draw_trend(self.clicked_abs_errors_m, x0, y0, w, chart_h, "Abs error trend", "m", (40, 210, 80))
+        draw_trend(self.clicked_rel_errors_pct, x0, y1, w, chart_h, "Rel error trend", "%", (70, 180, 255))
 
         return panel
 
