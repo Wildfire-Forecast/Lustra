@@ -6,7 +6,7 @@ class StereoProcessor:
     def __init__(self, fx, baseline_m):
         self.fx = fx
         self.baseline_m = baseline_m
-        self.num_disp = 16 * 12
+        self.num_disp = 16 * 4
         self.block_size = 5
         self.stereo = cv2.StereoSGBM_create(
             minDisparity=0,
