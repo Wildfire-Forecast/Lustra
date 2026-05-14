@@ -11,7 +11,9 @@ import pybullet_data
 
 from .config import get_project_paths
 from .visualization import draw_topdown_map
+from .visualization.world_map import WorldMapConfig, WorldMapUI
 from .vision.camera import get_camera_image, get_parallel_stereo_views
+from .vision.fire_tracker import FireTracker
 from .vision.geometry import camera_ray_to_world, get_camera_basis, intersect_ray_with_ground, pixel_to_camera_ray
 from .vision.stereo import StereoProcessor
 from .world import WorldBuilder
@@ -63,7 +65,7 @@ class LustraApp:
         self.conf_threshold = 0.40
 
         self.move_speed = 4
-        self.img_counter = 0
+        self.img_counter = self._next_image_counter()
         self.frame_i = 0
         self.show_stereo = True
         self.fire_body_id = None
@@ -79,7 +81,32 @@ class LustraApp:
         self._default_move_ttl_s = 0.18
         self._default_move_last_seen = 0.0
         self.controls_panel = self.make_controls_panel()
+        self.fire_map_path = os.path.join(self.paths.root_dir, "fire_map.html")
+        self.map_origin_lat = 39.0
+        self.map_origin_lon = 35.0
+        self.fire_map_config = WorldMapConfig(center_lat=self.map_origin_lat, center_lon=self.map_origin_lon, zoom_start=10)
+        self.fire_tracker = FireTracker(
+            origin_lat=self.map_origin_lat,
+            origin_lon=self.map_origin_lon,
+            distance_threshold_m=6.0,
+            ttl_s=4.0,
+            min_hits=2,
+        )
+        self._fire_map_interval_s = 1.0
+        self._last_fire_map_write = 0.0
+        self._fire_snapshot = []
         self._init_depth_compare_csv()
+
+    def _next_image_counter(self) -> int:
+        import re
+        existing = [
+            f for f in os.listdir(self.paths.captured_images_dir)
+            if re.match(r"rect_left_(\d+)\.png", f)
+        ]
+        if not existing:
+            return 0
+        indices = [int(re.match(r"rect_left_(\d+)\.png", f).group(1)) for f in existing]
+        return max(indices) + 1
 
     def make_controls_panel(self):
         panel = np.full((260, 420, 3), 18, dtype=np.uint8)
@@ -372,7 +399,7 @@ class LustraApp:
         if event == cv2.EVENT_LBUTTONDOWN and 0 <= x < self.width and 0 <= y < self.height:
             self.on_mouse(event, x, y, flags, None)
 
-    def make_default_view_panel(self, debug_left, topdown_map):
+    def make_default_view_panel(self, debug_left, topdown_map, fire_snapshot):
         depth_panel = self.make_depth_comparison_panel()
         left_h, left_w = debug_left.shape[:2]
         right_w = left_w
@@ -409,6 +436,28 @@ class LustraApp:
             cv2.putText(top_block, line, (tx, text_y), font, scale, color, thickness)
             text_y += th + (8 if i == 0 else 7)
 
+        tracker_x0 = max(map_w + 2 * pad, right_w - 260)
+        tracker_y0 = min(text_y + 6, top_h - 24)
+        tracker_w = right_w - tracker_x0 - pad
+        tracker_h = max(60, top_h - tracker_y0 - pad)
+        cv2.rectangle(top_block, (tracker_x0, tracker_y0), (tracker_x0 + tracker_w, tracker_y0 + tracker_h), (90, 90, 90), 1)
+        cv2.putText(top_block, "Fire Tracker", (tracker_x0 + 8, tracker_y0 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 230, 255), 1)
+
+        line_y = tracker_y0 + 40
+        if not fire_snapshot:
+            cv2.putText(top_block, "No active fires", (tracker_x0 + 8, line_y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
+        else:
+            for entry in fire_snapshot[:6]:
+                track_id = entry.get("track_id")
+                hits = entry.get("hits")
+                conf = entry.get("confidence")
+                age = entry.get("age_s")
+                label = f"#{track_id} hits={hits} conf={conf:.2f} age={age:.1f}s"
+                cv2.putText(top_block, label, (tracker_x0 + 8, line_y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1)
+                line_y += 18
+                if line_y > tracker_y0 + tracker_h - 8:
+                    break
+
         depth_resized = cv2.resize(depth_panel, (right_w, bottom_h), interpolation=cv2.INTER_LINEAR)
         right_column = np.vstack([top_block, h_spacer, depth_resized])
 
@@ -430,6 +479,61 @@ class LustraApp:
             ground_pt = intersect_ray_with_ground(eye_pos, ray_world, ground_z=0.0)
             ground_pts.append(ground_pt)
         return ground_pts
+
+    @staticmethod
+    def is_fire_detection(class_name: str) -> bool:
+        return "fire" in str(class_name).lower()
+
+    def estimate_range_from_bbox_edges(self, depth_m, x1, y1, x2, y2):
+        edge_points = [
+            (x1, y1),
+            (x2, y1),
+            (x1, y2),
+            (x2, y2),
+            ((x1 + x2) // 2, y1),
+            ((x1 + x2) // 2, y2),
+            (x1, (y1 + y2) // 2),
+            (x2, (y1 + y2) // 2),
+        ]
+        ranges = []
+        for px, py in edge_points:
+            z = self.stereo_processor.patch_median_depth(depth_m, int(px), int(py), half_size=6)
+            r = self.compute_range_from_depth(z, int(px), int(py))
+            if np.isfinite(r):
+                ranges.append(r)
+        if not ranges:
+            return np.nan
+        return float(np.median(np.array(ranges, dtype=np.float32)))
+
+    def update_fire_map(self, fire_polygons, timestamp_s):
+        self.fire_tracker.update(fire_polygons, timestamp_s)
+        self._fire_snapshot = self.fire_tracker.get_active_tracks(timestamp_s, include_unconfirmed=True)
+        if timestamp_s - self._last_fire_map_write < self._fire_map_interval_s:
+            return
+
+        drone_lon, drone_lat = self.fire_tracker.world_xy_to_lonlat((self.base_eye_pos[0], self.base_eye_pos[1]))
+        self.fire_map_config.center_lat = drone_lat
+        self.fire_map_config.center_lon = drone_lon
+
+        geojson = self.fire_tracker.to_geojson(timestamp_s)
+        map_ui = WorldMapUI(self.fire_map_config)
+        map_ui.add_markers(
+            [
+                {
+                    "lat": drone_lat,
+                    "lon": drone_lon
+                }
+            ],
+            name="Drone",
+            icon_color="blue",
+        )
+        if geojson.get("features"):
+            map_ui.add_fire_zones_geojson(
+                geojson,
+                style={"color": "#ff0000", "weight": 2, "fillOpacity": 0.4},
+            )
+        map_ui.save_html(self.fire_map_path)
+        self._last_fire_map_write = timestamp_s
 
     def process_click(self, debug_left, depth_m):
         if self.pending_click_point is not None:
@@ -644,6 +748,7 @@ class LustraApp:
                     print("[startup] Waiting for YOLO to finish loading...", flush=True)
                     self._detector_wait_printed = True
             yolo_ground_polygons = []
+            fire_polygons = []
 
             for det_i, det in enumerate(detections):
                 x1, y1, x2, y2 = det["x1"], det["y1"], det["x2"], det["y2"]
@@ -654,8 +759,7 @@ class LustraApp:
                 ground_poly = self.project_bbox_corners_to_ground(x1, y1, x2, y2)
                 yolo_ground_polygons.append(ground_poly)
 
-                fire_depth_z = self.stereo_processor.patch_median_depth(depth_m, bx, by, half_size=10)
-                fire_range_m = self.compute_range_from_depth(fire_depth_z, bx, by)
+                fire_range_m = self.estimate_range_from_bbox_edges(depth_m, x1, y1, x2, y2)
                 if np.isfinite(fire_range_m):
                     label = f"{class_name} {conf:.2f} | {fire_range_m:.2f} m"
                 else:
@@ -682,6 +786,16 @@ class LustraApp:
                         else f"[YOLO] #{det_i} {class_name} conf={conf:.2f} "
                         f"bbox=({x1},{y1},{x2},{y2}) center=({bx},{by}) range=nan"
                     )
+
+                if self.is_fire_detection(class_name):
+                    poly_xy = [(pt[0], pt[1]) for pt in ground_poly if pt is not None]
+                    if len(poly_xy) >= 3:
+                        fire_polygons.append(
+                            {
+                                "polygon_xy": poly_xy,
+                                "confidence": float(conf),
+                            }
+                        )
 
             if ord("c") in keys and keys[ord("c")] & p.KEY_WAS_TRIGGERED:
                 if self.clicked_ground_point is not None:
@@ -717,6 +831,8 @@ class LustraApp:
                 world_half_extent=80.0,
             )
 
+            self.update_fire_map(fire_polygons, time.time())
+
             if self.verbose:
                 self._show_clean_window(self.left_window_name, debug_left)
                 cv2.setMouseCallback(self.left_window_name, self.on_mouse)
@@ -724,7 +840,7 @@ class LustraApp:
                 self._show_clean_window("Top-Down Map", topdown)
                 self._show_clean_window("Depth Comparison", self.make_depth_comparison_panel())
             else:
-                default_panel = self.make_default_view_panel(debug_left, topdown)
+                default_panel = self.make_default_view_panel(debug_left, topdown, self._fire_snapshot)
                 self._show_default_window(default_panel)
                 cv2.setMouseCallback(self.default_window_name, self.on_mouse_default_view)
 
