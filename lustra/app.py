@@ -39,7 +39,7 @@ class LustraApp:
         self.clicked_error_band_value = np.nan
         self.saved_ground_points = []
 
-        self.width, self.height = 640, 640
+        self.render_width, self.render_height = 640, 640
         self.fov = 60
         self.near_val, self.far_val = 0.1, 120.0
 
@@ -48,11 +48,9 @@ class LustraApp:
         self.base_eye_pos = np.array([20.0, 20.0, self.drone_height_m], dtype=np.float32)
         self.baseline_m = 0.30
 
-        self.cx = self.width / 2.0
-        self.cy = self.height / 2.0
         fov_rad = np.deg2rad(self.fov)
-        self.fy = (self.height / 2.0) / np.tan(fov_rad / 2.0)
-        self.fx = self.fy * (self.width / self.height)
+        self.fy = (self.render_height / 2.0) / np.tan(fov_rad / 2.0)
+        self.fx = self.fy * (self.render_width / self.render_height)
 
         self.detector = None
         self._detector_thread = None
@@ -62,6 +60,13 @@ class LustraApp:
         self._detector_wait_printed = False
 
         self.stereo_processor = StereoProcessor(self.fx, self.baseline_m)
+        self.num_disp = self.stereo_processor.num_disp
+
+        self.width = self.render_width - self.num_disp
+        self.height = self.render_height
+        self.cx = self.render_width / 2.0 - self.num_disp
+        self.cy = self.render_height / 2.0
+
         self.conf_threshold = 0.40
 
         self.move_speed = 4
@@ -688,31 +693,41 @@ class LustraApp:
             )
             self.current_left_eye = left_eye
             self.current_left_target = left_target
-            img_left, left_depth_m, left_seg_mask = get_camera_image(
+            img_left_full, left_depth_full, left_seg_full = get_camera_image(
                 left_eye,
                 left_target,
                 self.cam_up,
                 self.fov,
-                self.width,
-                self.height,
+                self.render_width,
+                self.render_height,
                 self.near_val,
                 self.far_val,
                 return_depth_and_seg=True,
             )
-            self.current_left_depth_m = left_depth_m
-            self.current_left_seg_mask = left_seg_mask
             img_right = get_camera_image(
                 right_eye,
                 right_target,
                 self.cam_up,
                 self.fov,
-                self.width,
-                self.height,
+                self.render_width,
+                self.render_height,
                 self.near_val,
                 self.far_val,
             )
 
-            disp, depth_m, valid_ratio, disp_vis_u8, depth_vis_u8 = self.stereo_processor.compute_depth_and_visuals(img_left, img_right)
+            disp_full, depth_m_full, _, disp_vis_u8_full, depth_vis_u8_full = self.stereo_processor.compute_depth_and_visuals(img_left_full, img_right)
+
+            crop = self.num_disp
+            img_left = img_left_full[:, crop:]
+            left_depth_m = left_depth_full[:, crop:]
+            left_seg_mask = left_seg_full[:, crop:]
+            disp = disp_full[:, crop:]
+            depth_m = depth_m_full[:, crop:]
+            disp_vis_u8 = disp_vis_u8_full[:, crop:]
+            depth_vis_u8 = depth_vis_u8_full[:, crop:]
+            valid_ratio = float(np.isfinite(depth_m).mean())
+            self.current_left_depth_m = left_depth_m
+            self.current_left_seg_mask = left_seg_mask
 
             if self.frame_i % 30 == 0:
                 z_center = self.stereo_processor.patch_median_depth(depth_m, int(self.cx), int(self.cy), half_size=8)
