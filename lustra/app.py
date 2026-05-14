@@ -39,9 +39,11 @@ class LustraApp:
         self.clicked_error_band_value = np.nan
         self.saved_ground_points = []
 
+
         self.render_width, self.render_height = 640, 640
         self.fov = 60
-        self.near_val, self.far_val = 0.1, 120.0
+        #camera render dist -----------------v
+        self.near_val, self.far_val = 0.1, 400.0
 
         self.cam_up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
         self.cam_target = np.array([8.0, 8.0, 0.0], dtype=np.float32)
@@ -179,7 +181,8 @@ class LustraApp:
         print("[startup] Building world (this can take a bit)...", flush=True)
         wb = WorldBuilder(self.paths.assets_dir)
         wb.setup_base_world()
-        wb.build_biome_world(tile_size=4, grid_range=25)
+        #map size (only change this ----------------v)
+        wb.build_biome_world(tile_size=4, grid_range=50)
         ## fire spawner
         p.configureDebugVisualizer(p.COV_ENABLE_RENDERING, 0) ##better performance
         self.fire_body_id = wb.spawn_fire(center_pos=[25,25, 1], grid_size=7, max_radius=0.5, max_scale=20)
