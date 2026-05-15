@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import threading
 import time
@@ -11,6 +12,7 @@ import pybullet as p
 import pybullet_data
 
 from .config import get_project_paths
+from .prediction import PredictionEngine
 from .visualization import draw_topdown_map
 from .visualization.world_map import WorldMapConfig, WorldMapUI
 from .vision.camera import get_camera_image, get_parallel_stereo_views
@@ -23,10 +25,12 @@ os.environ["KMP_WARNINGS"] = "0"
 
 
 class LustraApp:
-    def __init__(self, verbose=False, drone_height_m=18.0):
+    def __init__(self, verbose=False, drone_height_m=18.0, origin_lat=33.45, origin_lon=-112.07):
         print("[startup] Initializing Lustra app...", flush=True)
         self.verbose = bool(verbose)
         self.drone_height_m = float(drone_height_m)
+        self._init_origin_lat = float(origin_lat)
+        self._init_origin_lon = float(origin_lon)
         self.left_window_name = "Left Eye (Reference)"
         self.default_window_name = "Lustra (Default View)"
         self.paths = get_project_paths()
@@ -90,8 +94,12 @@ class LustraApp:
         self._default_move_last_seen = 0.0
         self.controls_panel = self.make_controls_panel()
         self.fire_map_path = os.path.join(self.paths.root_dir, "fire_map.html")
-        self.map_origin_lat = 39.0
-        self.map_origin_lon = 35.0
+        # Defaults to Phoenix, AZ (reliably hot, low ambient wind, sparse
+        # vegetation -> live-weather demos produce visible spread without
+        # needing the synthetic toggle). Override per launch via --origin-lat
+        # / --origin-lon.
+        self.map_origin_lat = self._init_origin_lat
+        self.map_origin_lon = self._init_origin_lon
         self.fire_map_config = WorldMapConfig(center_lat=self.map_origin_lat, center_lon=self.map_origin_lon, zoom_start=10)
         self.fire_tracker = FireTracker(
             origin_lat=self.map_origin_lat,
@@ -110,6 +118,16 @@ class LustraApp:
         self._fire_map_interval_s = 1.0
         self._last_fire_map_write = 0.0
         self._fire_snapshot = []
+
+        self.prediction_engine = PredictionEngine()
+        self.prediction_horizons_min = (15.0, 30.0, 60.0)
+        self._prediction_interval_s = 15.0
+        self._last_prediction_at = 0.0
+        self._latest_prediction_geojson = {"type": "FeatureCollection", "features": []}
+        self._latest_weather_block = None
+        self._prediction_thread = None
+        self._prediction_lock = threading.Lock()
+
         self._init_depth_compare_csv()
 
     def _next_image_counter(self) -> int:
@@ -603,10 +621,17 @@ class LustraApp:
         fire_geojson = self.fire_tracker.to_geojson(timestamp_s)
         dry_geojson = self.dry_tracker.to_geojson(timestamp_s)
 
+        self._maybe_kick_prediction(fire_geojson, dry_geojson, timestamp_s)
+        with self._prediction_lock:
+            predicted_geojson = self._latest_prediction_geojson
+            weather_block = self._latest_weather_block
+
         state = {
             "geojson": fire_geojson,
             "fire_geojson": fire_geojson,
             "dry_geojson": dry_geojson,
+            "predicted_geojson": predicted_geojson,
+            "weather": weather_block,
             "drone": {"lat": float(drone_lat), "lon": float(drone_lon)},
         }
         state_path = os.path.join(self.paths.root_dir, "fire_state.json")
@@ -614,6 +639,53 @@ class LustraApp:
             json.dump(state, f)
 
         self._last_fire_map_write = timestamp_s
+
+    def _maybe_kick_prediction(self, fire_geojson, dry_geojson, timestamp_s):
+        if not fire_geojson.get("features"):
+            with self._prediction_lock:
+                self._latest_prediction_geojson = {"type": "FeatureCollection", "features": []}
+            return
+        if timestamp_s - self._last_prediction_at < self._prediction_interval_s:
+            return
+        if self._prediction_thread is not None and self._prediction_thread.is_alive():
+            return
+        self._last_prediction_at = timestamp_s
+        fire_snapshot = {"type": "FeatureCollection", "features": list(fire_geojson["features"])}
+        dry_snapshot = {"type": "FeatureCollection", "features": list(dry_geojson.get("features", []))}
+        self._prediction_thread = threading.Thread(
+            target=self._run_prediction,
+            args=(fire_snapshot, dry_snapshot),
+            daemon=True,
+        )
+        self._prediction_thread.start()
+
+    def _run_prediction(self, fire_geojson, dry_geojson):
+        try:
+            predicted = self.prediction_engine.predict(
+                fire_geojson,
+                horizons_min=self.prediction_horizons_min,
+                dry_geojson=dry_geojson if dry_geojson.get("features") else None,
+            )
+            fuel, weather, _terrain, spread = self.prediction_engine.diagnose(self.map_origin_lat, self.map_origin_lon)
+            weather_block = {
+                "temperature_c": float(weather.temperature_c),
+                "relative_humidity_pct": float(weather.relative_humidity_pct),
+                "wind_speed_10m_ms": float(weather.wind_speed_10m_ms),
+                "wind_direction_10m_deg": float(weather.wind_direction_10m_deg),
+                "timestamp_iso": str(weather.timestamp_iso),
+                "fuel_code": fuel.code,
+                "one_hour_fuel_moisture_pct": float(spread.one_hour_fuel_moisture_pct),
+                "rate_of_spread_m_per_min": float(spread.rate_of_spread_ms * 60.0),
+                "head_direction_deg": (None if not math.isfinite(spread.direction_of_max_spread_deg)
+                                       else float(spread.direction_of_max_spread_deg)),
+                "spread_supported": spread.rate_of_spread_ms > 1e-4,
+            }
+        except Exception as exc:
+            print(f"[prediction] failed: {type(exc).__name__}: {exc}", flush=True)
+            return
+        with self._prediction_lock:
+            self._latest_prediction_geojson = predicted
+            self._latest_weather_block = weather_block
 
     def process_click(self, debug_left, depth_m):
         if self.pending_click_point is not None:

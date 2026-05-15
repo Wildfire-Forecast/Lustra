@@ -14,7 +14,24 @@ if __name__ == "__main__":
         default=18.0,
         help="Initial drone height in meters",
     )
+    parser.add_argument(
+        "--origin-lat",
+        type=float,
+        default=33.45,
+        help="Real-world latitude that the simulator origin maps to (default: Phoenix, AZ).",
+    )
+    parser.add_argument(
+        "--origin-lon",
+        type=float,
+        default=-112.07,
+        help="Real-world longitude that the simulator origin maps to (default: Phoenix, AZ).",
+    )
     args = parser.parse_args()
 
     print("[boot] Starting app...", flush=True)
-    LustraApp(verbose=args.verbose, drone_height_m=args.drone_height_m).run()
+    LustraApp(
+        verbose=args.verbose,
+        drone_height_m=args.drone_height_m,
+        origin_lat=args.origin_lat,
+        origin_lon=args.origin_lon,
+    ).run()
