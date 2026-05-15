@@ -1,3 +1,4 @@
+import json
 import os
 import threading
 import time
@@ -99,6 +100,13 @@ class LustraApp:
             ttl_s=4.0,
             min_hits=2,
         )
+        self.dry_tracker = FireTracker(
+            origin_lat=self.map_origin_lat,
+            origin_lon=self.map_origin_lon,
+            distance_threshold_m=6.0,
+            ttl_s=4.0,
+            min_hits=2,
+        )
         self._fire_map_interval_s = 1.0
         self._last_fire_map_write = 0.0
         self._fire_snapshot = []
@@ -182,7 +190,7 @@ class LustraApp:
         wb = WorldBuilder(self.paths.assets_dir)
         wb.setup_base_world()
         #map size (only change this ----------------v)
-        wb.build_biome_world(tile_size=4, grid_range=50)
+        wb.build_biome_world(tile_size=4, grid_range=25)
         ## fire spawner
         p.configureDebugVisualizer(p.COV_ENABLE_RENDERING, 0) ##better performance
         self.fire_body_id = wb.spawn_fire(center_pos=[25,25, 1], grid_size=7, max_radius=0.5, max_scale=20)
@@ -471,6 +479,66 @@ class LustraApp:
 
         return np.hstack([debug_left, v_spacer, right_column])
 
+    def compute_camera_footprint(self):
+        """Project the four image corners onto the ground plane.
+
+        Returns (footprint_xy, reliability) where footprint_xy is a list of
+        (x, y) ground points in cyclic order (TL, TR, BR, BL) with any
+        unusable corners filtered out, and reliability is the fraction of
+        corners that resolved cleanly (0..1). Returns (None, 0.0) when fewer
+        than 3 corners are usable — caller should skip miss-tracking.
+        """
+        corners_img = [
+            (0, 0),
+            (self.width - 1, 0),
+            (self.width - 1, self.height - 1),
+            (0, self.height - 1),
+        ]
+        eye_pos = self.current_left_eye
+        target_pos = self.current_left_target
+        # Cap usable range so near-horizon rays don't claim to see kilometers.
+        max_range = 4.0 * max(float(self.drone_height_m), 1.0)
+        valid_points: list = []
+        valid_count = 0
+        for (u, v) in corners_img:
+            ray_cam = pixel_to_camera_ray(u, v, self.fx, self.fy, self.cx, self.cy)
+            ray_world = camera_ray_to_world(ray_cam, eye_pos, target_pos, self.cam_up)
+            pt = intersect_ray_with_ground(eye_pos, ray_world, ground_z=0.0)
+            if pt is None:
+                continue
+            if float(np.linalg.norm(pt - eye_pos)) > max_range:
+                continue
+            valid_points.append((float(pt[0]), float(pt[1])))
+            valid_count += 1
+        if valid_count < 3:
+            return None, 0.0
+        return valid_points, valid_count / 4.0
+
+    def project_bbox_corners_via_stereo(self, depth_m, x1, y1, x2, y2):
+        corners_img = [
+            (x1, y1),
+            (x2, y1),
+            (x2, y2),
+            (x1, y2),
+        ]
+        eye_pos = self.current_left_eye
+        target_pos = self.current_left_target
+        world_pts = []
+        for (u, v) in corners_img:
+            z = self.stereo_processor.patch_median_depth(depth_m, int(u), int(v), half_size=6)
+            if not np.isfinite(z) or z <= 0.0:
+                world_pts.append(None)
+                continue
+            ray_cam = pixel_to_camera_ray(u, v, self.fx, self.fy, self.cx, self.cy)
+            if ray_cam[2] <= 1e-6:
+                world_pts.append(None)
+                continue
+            range_m = float(z / ray_cam[2])
+            ray_world = camera_ray_to_world(ray_cam, eye_pos, target_pos, self.cam_up)
+            pt = eye_pos + ray_world * range_m
+            world_pts.append((float(pt[0]), float(pt[1])))
+        return world_pts
+
     def project_bbox_corners_to_ground(self, x1, y1, x2, y2):
         corners_img = [
             (x1, y1),
@@ -491,6 +559,10 @@ class LustraApp:
     @staticmethod
     def is_fire_detection(class_name: str) -> bool:
         return "fire" in str(class_name).lower()
+
+    @staticmethod
+    def is_dry_detection(class_name: str) -> bool:
+        return "dry" in str(class_name).lower()
 
     def estimate_range_from_bbox_edges(self, depth_m, x1, y1, x2, y2):
         edge_points = [
@@ -513,8 +585,13 @@ class LustraApp:
             return np.nan
         return float(np.median(np.array(ranges, dtype=np.float32)))
 
-    def update_fire_map(self, fire_polygons, timestamp_s):
+    def update_fire_map(self, fire_polygons, dry_polygons, footprint_xy, frame_weight, timestamp_s):
         self.fire_tracker.update(fire_polygons, timestamp_s)
+        self.dry_tracker.update(dry_polygons, timestamp_s)
+        fire_det_polys = [d["polygon_xy"] for d in fire_polygons if d.get("polygon_xy")]
+        dry_det_polys = [d["polygon_xy"] for d in dry_polygons if d.get("polygon_xy")]
+        self.fire_tracker.mark_misses(footprint_xy, frame_weight, timestamp_s, fire_det_polys)
+        self.dry_tracker.mark_misses(footprint_xy, frame_weight, timestamp_s, dry_det_polys)
         self._fire_snapshot = self.fire_tracker.get_active_tracks(timestamp_s, include_unconfirmed=True)
         if timestamp_s - self._last_fire_map_write < self._fire_map_interval_s:
             return
@@ -523,24 +600,19 @@ class LustraApp:
         self.fire_map_config.center_lat = drone_lat
         self.fire_map_config.center_lon = drone_lon
 
-        geojson = self.fire_tracker.to_geojson(timestamp_s)
-        map_ui = WorldMapUI(self.fire_map_config)
-        map_ui.add_markers(
-            [
-                {
-                    "lat": drone_lat,
-                    "lon": drone_lon
-                }
-            ],
-            name="Drone",
-            icon_color="blue",
-        )
-        if geojson.get("features"):
-            map_ui.add_fire_zones_geojson(
-                geojson,
-                style={"color": "#ff0000", "weight": 2, "fillOpacity": 0.4},
-            )
-        map_ui.save_html(self.fire_map_path)
+        fire_geojson = self.fire_tracker.to_geojson(timestamp_s)
+        dry_geojson = self.dry_tracker.to_geojson(timestamp_s)
+
+        state = {
+            "geojson": fire_geojson,
+            "fire_geojson": fire_geojson,
+            "dry_geojson": dry_geojson,
+            "drone": {"lat": float(drone_lat), "lon": float(drone_lon)},
+        }
+        state_path = os.path.join(self.paths.root_dir, "fire_state.json")
+        with open(state_path, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+
         self._last_fire_map_write = timestamp_s
 
     def process_click(self, debug_left, depth_m):
@@ -767,6 +839,7 @@ class LustraApp:
                     self._detector_wait_printed = True
             yolo_ground_polygons = []
             fire_polygons = []
+            dry_polygons = []
 
             for det_i, det in enumerate(detections):
                 x1, y1, x2, y2 = det["x1"], det["y1"], det["x2"], det["y2"]
@@ -805,15 +878,20 @@ class LustraApp:
                         f"bbox=({x1},{y1},{x2},{y2}) center=({bx},{by}) range=nan"
                     )
 
-                if self.is_fire_detection(class_name):
-                    poly_xy = [(pt[0], pt[1]) for pt in ground_poly if pt is not None]
+                is_fire = self.is_fire_detection(class_name)
+                is_dry = self.is_dry_detection(class_name)
+                if is_fire or is_dry:
+                    stereo_poly = self.project_bbox_corners_via_stereo(depth_m, x1, y1, x2, y2)
+                    poly_xy = [pt for pt in stereo_poly if pt is not None]
+                    # Fall back to ground-plane projection only if stereo lost too many corners
+                    if len(poly_xy) < 3:
+                        poly_xy = [(pt[0], pt[1]) for pt in ground_poly if pt is not None]
                     if len(poly_xy) >= 3:
-                        fire_polygons.append(
-                            {
-                                "polygon_xy": poly_xy,
-                                "confidence": float(conf),
-                            }
-                        )
+                        entry = {"polygon_xy": poly_xy, "confidence": float(conf)}
+                        if is_fire:
+                            fire_polygons.append(entry)
+                        else:
+                            dry_polygons.append(entry)
 
             if ord("c") in keys and keys[ord("c")] & p.KEY_WAS_TRIGGERED:
                 if self.clicked_ground_point is not None:
@@ -849,7 +927,15 @@ class LustraApp:
                 world_half_extent=80.0,
             )
 
-            self.update_fire_map(fire_polygons, time.time())
+            footprint_xy, footprint_reliability = self.compute_camera_footprint()
+            frame_weight = float(footprint_reliability) * float(valid_ratio)
+            self.update_fire_map(
+                fire_polygons,
+                dry_polygons,
+                footprint_xy,
+                frame_weight,
+                time.time(),
+            )
 
             if self.verbose:
                 self._show_clean_window(self.left_window_name, debug_left)
