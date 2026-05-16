@@ -17,14 +17,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--origin-lat",
         type=float,
-        default=33.45,
-        help="Real-world latitude that the simulator origin maps to (default: Phoenix, AZ).",
+        default=38.3700,
+        help="Real-world latitude that the simulator origin maps to (default: DEÜ Tınaztepe, Buca/İzmir).",
     )
     parser.add_argument(
         "--origin-lon",
         type=float,
-        default=-112.07,
-        help="Real-world longitude that the simulator origin maps to (default: Phoenix, AZ).",
+        default=27.2050,
+        help="Real-world longitude that the simulator origin maps to (default: DEÜ Tınaztepe, Buca/İzmir).",
     )
     args = parser.parse_args()
 

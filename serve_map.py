@@ -3,83 +3,28 @@
 from __future__ import annotations
 
 import json
-import math
 import os
 import threading
+import time
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Optional, Tuple
 
 REFRESH_MS = 1000
 
+# Edit these to change the location-jump buttons in the GUI.
+# Sites picked for southwestern-Türkiye Mediterranean fire belt (2021 megafires).
+LOCATIONS = [
+    {"name": "DEÜ Buca", "lat": 38.3700, "lon": 27.2050},
+    {"name": "Antalya",  "lat": 36.8969, "lon": 30.7133},
+    {"name": "Manavgat", "lat": 36.7869, "lon": 31.4433},
+    {"name": "Marmaris", "lat": 36.8550, "lon": 28.2750},
+    {"name": "Datça",    "lat": 36.7257, "lon": 27.6850},
+]
 
-# -----------------------------------------------------------------------------
-# Demo mode: override live weather with a deterministic Anatolian summer
-# afternoon so the user can see the predicted spread under fire-supportive
-# conditions even when current live weather doesn't support fire (cold/wet).
-# -----------------------------------------------------------------------------
-_demo_mode_enabled = False
-_demo_lock = threading.Lock()
-_demo_cache_key: Optional[Tuple[str, str]] = None
-_demo_cache_payload: Optional[dict] = None
-_demo_engine = None
-
-
-def _get_demo_engine():
-    global _demo_engine
-    if _demo_engine is None:
-        from lustra.prediction import PredictionEngine, WeatherSnapshot
-        snap = WeatherSnapshot(
-            latitude=39.0, longitude=35.0,
-            timestamp_iso="DEMO: Anatolian summer afternoon",
-            temperature_c=32.0, relative_humidity_pct=22.0,
-            wind_speed_10m_ms=5.0, wind_direction_10m_deg=315.0,
-        )
-        _demo_engine = PredictionEngine(weather_override=snap)
-    return _demo_engine
-
-
-def _apply_demo_overrides(state: dict) -> dict:
-    """Replace state['weather'] and state['predicted_geojson'] using the demo engine."""
-    global _demo_cache_key, _demo_cache_payload
-    fire_gj = state.get("fire_geojson") or {"type": "FeatureCollection", "features": []}
-    dry_gj = state.get("dry_geojson") or {"type": "FeatureCollection", "features": []}
-
-    key = (
-        json.dumps(fire_gj, sort_keys=True),
-        json.dumps(dry_gj, sort_keys=True),
-    )
-    with _demo_lock:
-        if key == _demo_cache_key and _demo_cache_payload is not None:
-            payload = _demo_cache_payload
-        else:
-            engine = _get_demo_engine()
-            pred_gj = engine.predict(
-                fire_gj, horizons_min=[15, 30, 60],
-                dry_geojson=(dry_gj if dry_gj.get("features") else None),
-            )
-            fuel, w, _, spread = engine.diagnose(39.0, 35.0)
-            weather_block = {
-                "temperature_c": float(w.temperature_c),
-                "relative_humidity_pct": float(w.relative_humidity_pct),
-                "wind_speed_10m_ms": float(w.wind_speed_10m_ms),
-                "wind_direction_10m_deg": float(w.wind_direction_10m_deg),
-                "timestamp_iso": str(w.timestamp_iso),
-                "fuel_code": fuel.code,
-                "one_hour_fuel_moisture_pct": float(spread.one_hour_fuel_moisture_pct),
-                "rate_of_spread_m_per_min": float(spread.rate_of_spread_ms * 60.0),
-                "head_direction_deg": (None if not math.isfinite(spread.direction_of_max_spread_deg)
-                                       else float(spread.direction_of_max_spread_deg)),
-                "spread_supported": spread.rate_of_spread_ms > 1e-4,
-                "mode": "demo",
-            }
-            payload = {"weather": weather_block, "predicted_geojson": pred_gj}
-            _demo_cache_key = key
-            _demo_cache_payload = payload
-
-    state["weather"] = payload["weather"]
-    state["predicted_geojson"] = payload["predicted_geojson"]
-    return state
+# Sidecar file: serve_map.py writes here, LustraApp polls it and re-anchors
+# its map origin (which shifts every drone/fire/prediction lat-lon on the map).
+ORIGIN_COMMAND_PATH = Path(__file__).resolve().parent / "origin_command.json"
+_origin_lock = threading.Lock()
 
 # __REFRESH_MS__ is replaced below — avoids doubling every {{ }} in CSS/JS
 _INDEX_TEMPLATE = """\
@@ -88,7 +33,7 @@ _INDEX_TEMPLATE = """\
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Lustra — Fire Tracker</title>
+  <title>Lustro</title>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script src="https://unpkg.com/@turf/turf@7.2.0/turf.min.js"></script>
@@ -107,19 +52,11 @@ _INDEX_TEMPLATE = """\
       flex-shrink: 0; color: #eee;
     }
     h1 { font-size: 0.95rem; color: #ff6b35; letter-spacing: 2px; text-transform: uppercase; }
-    .dot {
-      width: 9px; height: 9px; border-radius: 50%;
-      background: #555;
-      transition: background 0.4s;
-      animation: pulse 1.5s ease-in-out infinite;
-    }
-    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.2; } }
     .badge {
       font-size: 0.7rem; color: #999;
       background: #222; border: 1px solid #333;
       padding: 2px 9px; border-radius: 99px;
     }
-    #status { font-size: 0.72rem; color: #888; }
     #last-update { margin-left: auto; font-size: 0.72rem; color: #555; }
     #map { flex: 1; position: relative; }
     #wind-widget {
@@ -143,65 +80,47 @@ _INDEX_TEMPLATE = """\
     }
     #wind-widget .label { color: #888; }
     #wind-widget .val { color: #eee; font-weight: 600; font-variant-numeric: tabular-nums; }
-    #wind-widget .compass {
-      width: 70px; height: 70px; margin: 6px auto;
-      position: relative; display: block;
-    }
-    #wind-widget .compass svg { width: 100%; height: 100%; }
-    #wind-widget .compass .arrow {
-      transform-origin: 35px 35px;
-      transition: transform 0.6s ease-out;
-    }
     #wind-widget .head { color: #ffd23f; }
     #wind-widget .no-spread {
       color: #b87878; font-style: italic; font-size: 0.7rem;
       margin-top: 4px; line-height: 1.4;
     }
-    #wind-widget .mode-row {
-      margin-top: 8px; padding-top: 8px; border-top: 1px solid #2a2a2a;
+    #loc-widget {
+      position: absolute; top: 14px; left: 60px;
+      z-index: 1000;
+      background: rgba(17, 17, 17, 0.88); color: #eee;
+      border: 1px solid #333; border-radius: 8px;
+      padding: 10px 14px;
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      font-size: 0.72rem;
+      box-shadow: 0 4px 18px rgba(0,0,0,0.5);
     }
-    #wind-widget .switch {
-      position: relative; display: inline-block; width: 34px; height: 18px;
+    #loc-widget .title {
+      color: #ff6b35; font-size: 0.65rem; letter-spacing: 1.5px;
+      text-transform: uppercase; margin-bottom: 6px;
     }
-    #wind-widget .switch input { opacity: 0; width: 0; height: 0; }
-    #wind-widget .slider {
-      position: absolute; cursor: pointer; inset: 0;
-      background: #333; border-radius: 18px; transition: 0.25s;
+    #loc-widget .btns { display: flex; flex-direction: column; gap: 4px; }
+    #loc-widget button {
+      background: #222; color: #eee; border: 1px solid #333;
+      padding: 5px 10px; border-radius: 4px; cursor: pointer;
+      font-size: 0.72rem; font-family: inherit; text-align: left;
+      transition: background 0.15s, border-color 0.15s;
     }
-    #wind-widget .slider::before {
-      position: absolute; content: ""; height: 14px; width: 14px; left: 2px; bottom: 2px;
-      background: #ddd; border-radius: 50%; transition: 0.25s;
+    #loc-widget button:hover { background: #2a2a2a; border-color: #ff6b35; }
+    #loc-widget button.active {
+      background: #3a2418; border-color: #ff6b35; color: #ff6b35;
     }
-    #wind-widget input:checked + .slider { background: #ff6b35; }
-    #wind-widget input:checked + .slider::before { transform: translateX(16px); }
-    #wind-widget .mode-live { color: #4caf50; }
-    #wind-widget .mode-demo { color: #ff6b35; }
   </style>
 </head>
 <body>
   <header>
-    <div class="dot" id="dot"></div>
-    <h1>Lustro — Fire Tracker</h1>
+    <h1>Lustro</h1>
     <span class="badge" id="fire-count">— fires</span>
-    <span id="status">connecting…</span>
     <span id="last-update">—</span>
   </header>
   <div id="map">
     <div id="wind-widget" style="display: none;">
       <div class="title">Weather</div>
-      <div class="compass">
-        <svg viewBox="0 0 70 70">
-          <circle cx="35" cy="35" r="30" fill="none" stroke="#333" stroke-width="1"/>
-          <text x="35" y="11" text-anchor="middle" fill="#666" font-size="7">N</text>
-          <text x="35" y="64" text-anchor="middle" fill="#666" font-size="7">S</text>
-          <text x="62" y="38" text-anchor="middle" fill="#666" font-size="7">E</text>
-          <text x="8"  y="38" text-anchor="middle" fill="#666" font-size="7">W</text>
-          <g id="wind-arrow" class="arrow">
-            <line x1="35" y1="35" x2="35" y2="14" stroke="#ffd23f" stroke-width="2.5" stroke-linecap="round"/>
-            <polygon points="35,8 32,14 38,14" fill="#ffd23f"/>
-          </g>
-        </svg>
-      </div>
       <div class="row"><span class="label">Wind</span><span class="val" id="wind-val">— m/s</span></div>
       <div class="row"><span class="label">From</span><span class="val" id="wind-dir-val">—</span></div>
       <div class="row"><span class="label">Temp</span><span class="val" id="temp-val">—</span></div>
@@ -211,14 +130,10 @@ _INDEX_TEMPLATE = """\
       <div class="no-spread" id="no-spread-msg" style="display: none;">
         Weather does not support spread<br>(fuel moisture &gt; extinction)
       </div>
-      <div class="row mode-row">
-        <span class="label">Mode</span>
-        <label class="switch" title="Toggle between live Open-Meteo weather and a synthetic hot/dry demo scenario">
-          <input type="checkbox" id="demo-toggle">
-          <span class="slider"></span>
-        </label>
-        <span class="val mode-live" id="mode-val">Live</span>
-      </div>
+    </div>
+    <div id="loc-widget">
+      <div class="title">Locations</div>
+      <div class="btns" id="loc-btns"></div>
     </div>
   </div>
   <script>
@@ -413,12 +328,9 @@ _INDEX_TEMPLATE = """\
     let droneMarker = null;
     let firstFit = true;
 
-    const dot        = document.getElementById('dot');
     const fireCount  = document.getElementById('fire-count');
-    const statusEl   = document.getElementById('status');
     const lastUpdate = document.getElementById('last-update');
     const windWidget = document.getElementById('wind-widget');
-    const windArrow  = document.getElementById('wind-arrow');
     const windVal    = document.getElementById('wind-val');
     const windDirVal = document.getElementById('wind-dir-val');
     const tempVal    = document.getElementById('temp-val');
@@ -426,37 +338,40 @@ _INDEX_TEMPLATE = """\
     const fmVal      = document.getElementById('fm-val');
     const rosVal     = document.getElementById('ros-val');
     const noSpreadMsg = document.getElementById('no-spread-msg');
-    const demoToggle = document.getElementById('demo-toggle');
-    const modeVal    = document.getElementById('mode-val');
+    const locBtns    = document.getElementById('loc-btns');
 
-    function setModeLabel(isDemo) {
-      modeVal.textContent = isDemo ? 'Demo' : 'Live';
-      modeVal.className = 'val ' + (isDemo ? 'mode-demo' : 'mode-live');
-    }
+    const LOCATIONS = __LOCATIONS_JSON__;
+    let activeLoc = null;
 
-    async function loadDemoMode() {
+    async function relocate(loc, btn) {
+      // Tell LustraApp to re-anchor the simulator origin (this shifts the
+      // drone marker and every fire/predicted polygon on the map).
       try {
-        const r = await fetch('/demo-mode');
-        const j = await r.json();
-        demoToggle.checked = !!j.enabled;
-        setModeLabel(j.enabled);
-      } catch (_) { /* leave as-is */ }
-    }
-
-    async function setDemoMode(enabled) {
-      try {
-        const r = await fetch('/demo-mode', {
+        await fetch('/origin', {
           method: 'POST', headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({enabled}),
+          body: JSON.stringify({lat: loc.lat, lon: loc.lon, name: loc.name}),
         });
-        const j = await r.json();
-        setModeLabel(j.enabled);
-      } catch (_) { /* swallow */ }
-      update();
+      } catch (_) { /* network errors are non-fatal; the map fly-to still runs */ }
+      // map.getMaxZoom() returns 19 (set by the OSM tile layer above) — the
+      // tightest zoom the basemap supports for the picked location.
+      map.flyTo([loc.lat, loc.lon], map.getMaxZoom(), { duration: 1.2 });
+      firstFit = false;  // user took control of the view; don't auto-fit again
+      activeLoc = loc.name;
+      for (const b of locBtns.children) {
+        b.classList.toggle('active', b.dataset.name === loc.name);
+      }
+      // Trigger a refresh so the drone marker moves immediately once the
+      // app picks up the new origin on its next tick.
+      setTimeout(update, 1200);
     }
 
-    demoToggle.addEventListener('change', () => setDemoMode(demoToggle.checked));
-    loadDemoMode();
+    for (const loc of LOCATIONS) {
+      const btn = document.createElement('button');
+      btn.textContent = loc.name;
+      btn.dataset.name = loc.name;
+      btn.addEventListener('click', () => relocate(loc, btn));
+      locBtns.appendChild(btn);
+    }
 
     function cardinalName(deg) {
       const names = ['N','NNE','NE','ENE','E','ESE','SE','SSE','S','SSW','SW','WSW','W','WNW','NW','NNW'];
@@ -467,10 +382,6 @@ _INDEX_TEMPLATE = """\
       if (!w) { windWidget.style.display = 'none'; return; }
       windWidget.style.display = 'block';
       const from = w.wind_direction_10m_deg ?? 0;
-      // Arrow shows the direction the wind is BLOWING TOWARD (i.e., 180° from "from"),
-      // which is also the head-fire direction; that's what matters operationally.
-      const blowingToward = (from + 180) % 360;
-      windArrow.setAttribute('transform', `rotate(${blowingToward} 35 35)`);
       windVal.textContent = (w.wind_speed_10m_ms ?? 0).toFixed(2) + ' m/s';
       windDirVal.textContent = `${cardinalName(from)} (${Math.round(from)}°)`;
       tempVal.textContent = (w.temperature_c ?? 0).toFixed(1) + ' °C';
@@ -541,12 +452,9 @@ _INDEX_TEMPLATE = """\
 
         updateWindWidget(state.weather);
 
-        dot.style.background = '#4caf50';
-        statusEl.textContent = 'live';
         lastUpdate.textContent = 'Updated ' + new Date().toLocaleTimeString();
       } catch (_) {
-        dot.style.background = '#e53935';
-        statusEl.textContent = 'waiting for app…';
+        lastUpdate.textContent = 'Waiting for app…';
       }
     }
 
@@ -557,7 +465,12 @@ _INDEX_TEMPLATE = """\
 </html>
 """
 
-_INDEX_HTML: bytes = _INDEX_TEMPLATE.replace("__REFRESH_MS__", str(REFRESH_MS)).encode()
+_INDEX_HTML: bytes = (
+    _INDEX_TEMPLATE
+    .replace("__REFRESH_MS__", str(REFRESH_MS))
+    .replace("__LOCATIONS_JSON__", json.dumps(LOCATIONS))
+    .encode()
+)
 _EMPTY_STATE: bytes = (
     b'{"geojson":{"type":"FeatureCollection","features":[]},'
     b'"fire_geojson":{"type":"FeatureCollection","features":[]},'
@@ -577,21 +490,7 @@ class FireMapHandler(SimpleHTTPRequestHandler):
 
         elif path == "/state":
             state_file = Path("fire_state.json")
-            raw = state_file.read_bytes() if state_file.exists() else _EMPTY_STATE
-            if _demo_mode_enabled:
-                try:
-                    state = json.loads(raw)
-                    state = _apply_demo_overrides(state)
-                    body = json.dumps(state).encode("utf-8")
-                except Exception as exc:
-                    self._send(500, "application/json", json.dumps({"error": str(exc)}).encode())
-                    return
-            else:
-                body = raw
-            self._send(200, "application/json", body)
-
-        elif path == "/demo-mode":
-            body = json.dumps({"enabled": _demo_mode_enabled}).encode()
+            body = state_file.read_bytes() if state_file.exists() else _EMPTY_STATE
             self._send(200, "application/json", body)
 
         else:
@@ -599,21 +498,26 @@ class FireMapHandler(SimpleHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = self.path.split("?")[0]
-        if path == "/demo-mode":
-            global _demo_mode_enabled, _demo_cache_key, _demo_cache_payload
+        if path == "/origin":
             length = int(self.headers.get("Content-Length", 0))
             try:
                 payload = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
-                enabled = bool(payload.get("enabled", False))
+                lat = float(payload["lat"])
+                lon = float(payload["lon"])
+                name = str(payload.get("name", ""))
             except Exception:
                 self._send(400, "application/json", b'{"error":"bad request"}')
                 return
-            with _demo_lock:
-                _demo_mode_enabled = enabled
-                _demo_cache_key = None
-                _demo_cache_payload = None
-            body = json.dumps({"enabled": _demo_mode_enabled}).encode()
-            self._send(200, "application/json", body)
+            with _origin_lock:
+                # Monotonic ns timestamp as the sequence: always increases
+                # across serve_map.py restarts, so a stale file from an
+                # earlier session can never out-rank a fresh click.
+                cmd = {"seq": time.time_ns(), "lat": lat, "lon": lon, "name": name}
+                tmp = ORIGIN_COMMAND_PATH.with_suffix(".json.tmp")
+                tmp.write_text(json.dumps(cmd))
+                tmp.replace(ORIGIN_COMMAND_PATH)
+            print(f"[origin] wrote {ORIGIN_COMMAND_PATH.name} -> {name} ({lat:.4f}, {lon:.4f})", flush=True)
+            self._send(200, "application/json", json.dumps(cmd).encode())
         else:
             self._send(404, "application/json", b'{"error":"not found"}')
 

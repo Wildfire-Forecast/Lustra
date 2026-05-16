@@ -46,6 +46,7 @@ class FireTracker:
         growth_chunk_cells: int = 16,
         gain_per_s: float = 2.0,
         decay_per_s: float = 1.0,
+        max_cell_value: float = 1.0,
         activation_threshold: float = 0.5,
         death_threshold: float = 0.1,
         merge_overlap_min_cells: int = 4,
@@ -66,6 +67,12 @@ class FireTracker:
         self.growth_chunk_cells = int(growth_chunk_cells)
         self.gain_per_s = float(gain_per_s)
         self.decay_per_s = float(decay_per_s)
+        # Cells accumulate above the activation threshold up to this ceiling,
+        # building a "reserve" against transient YOLO bbox wobble. A higher
+        # ceiling makes edges stickier — they can lose value during brief
+        # detection gaps without falling below activation — at the cost of
+        # slower cleanup when a fire truly stops being detected.
+        self.max_cell_value = float(max_cell_value)
         self.activation_threshold = float(activation_threshold)
         self.death_threshold = float(death_threshold)
         self.merge_overlap_min_cells = int(merge_overlap_min_cells)
@@ -153,11 +160,14 @@ class FireTracker:
 
         survivors: List[FireTrack] = []
         for track in self._tracks:
-            # Just-updated tracks already had gain applied in update();
-            # skip miss accumulation for them this frame.
-            if track.last_seen_s >= timestamp_s - 1e-6:
-                survivors.append(track)
-                continue
+            # Note: updated tracks are NOT skipped — the per-cell decay
+            # below already excludes ``detected_mask`` (the cells that
+            # just received gain), so updated tracks correctly decay the
+            # parts of their grid that are inside the footprint but
+            # outside any current detection. Skipping the whole track
+            # here was the bug that kept "bridge" cells alive between
+            # two physically separate fires that a stray YOLO bbox had
+            # once spanned.
 
             # Skip tracks whose grids don't overlap the footprint's AABB.
             fp_arr = np.asarray(footprint_xy, dtype=np.float32)
@@ -189,7 +199,7 @@ class FireTracker:
                 decay_region = footprint_mask.astype(bool)
 
             track.grid[decay_region] -= decay_amount
-            np.clip(track.grid, 0.0, 1.0, out=track.grid)
+            np.clip(track.grid, 0.0, self.max_cell_value, out=track.grid)
 
             # If no cell is meaningfully alive anymore, the track is dead.
             if float(track.grid.max()) < self.death_threshold:
@@ -381,7 +391,7 @@ class FireTracker:
         if gain <= 0.0:
             return
         track.grid[mask.astype(bool)] += gain
-        np.clip(track.grid, 0.0, 1.0, out=track.grid)
+        np.clip(track.grid, 0.0, self.max_cell_value, out=track.grid)
 
     def _find_match_for_detection(
         self,

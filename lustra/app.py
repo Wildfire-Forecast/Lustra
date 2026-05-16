@@ -14,7 +14,6 @@ import pybullet_data
 from .config import get_project_paths
 from .prediction import PredictionEngine
 from .visualization import draw_topdown_map
-from .visualization.world_map import WorldMapConfig, WorldMapUI
 from .vision.camera import get_camera_image, get_parallel_stereo_views
 from .vision.fire_tracker import FireTracker
 from .vision.geometry import camera_ray_to_world, get_camera_basis, intersect_ray_with_ground, pixel_to_camera_ray
@@ -25,7 +24,7 @@ os.environ["KMP_WARNINGS"] = "0"
 
 
 class LustraApp:
-    def __init__(self, verbose=False, drone_height_m=18.0, origin_lat=33.45, origin_lon=-112.07):
+    def __init__(self, verbose=False, drone_height_m=18.0, origin_lat=38.3700, origin_lon=27.2050):
         print("[startup] Initializing Lustra app...", flush=True)
         self.verbose = bool(verbose)
         self.drone_height_m = float(drone_height_m)
@@ -93,31 +92,57 @@ class LustraApp:
         self._default_move_ttl_s = 0.18
         self._default_move_last_seen = 0.0
         self.controls_panel = self.make_controls_panel()
-        self.fire_map_path = os.path.join(self.paths.root_dir, "fire_map.html")
-        # Defaults to Phoenix, AZ (reliably hot, low ambient wind, sparse
-        # vegetation -> live-weather demos produce visible spread without
-        # needing the synthetic toggle). Override per launch via --origin-lat
-        # / --origin-lon.
+        # Defaults to Dokuz Eylül University Tınaztepe campus
+        # (Buca/İzmir). Override per launch via --origin-lat / --origin-lon.
         self.map_origin_lat = self._init_origin_lat
         self.map_origin_lon = self._init_origin_lon
-        self.fire_map_config = WorldMapConfig(center_lat=self.map_origin_lat, center_lon=self.map_origin_lon, zoom_start=10)
+        # Tighter merge defaults: a 6 m centroid threshold + a 2-cell merge
+        # dilation lets visually separate fires fuse into a single elongated
+        # track once their grids drift toward each other. Pull both knobs
+        # down so two genuinely separate fires stay as two GeoJSON features.
+        #
+        # Fire tracker also runs a stricter gain/decay ratio (1.5 / 1.0 →
+        # 40 % breakeven detection rate, up from the default 33 %) so
+        # bridge cells from occasional wide YOLO bboxes die faster. The
+        # dry tracker keeps the default 2 / 1 because dry detection is
+        # noisier and would erode legitimate edges at the stricter ratio.
         self.fire_tracker = FireTracker(
             origin_lat=self.map_origin_lat,
             origin_lon=self.map_origin_lon,
-            distance_threshold_m=6.0,
+            distance_threshold_m=2.5,
             ttl_s=4.0,
             min_hits=2,
+            merge_dilate_cells=0,
+            merge_overlap_min_cells=6,
+            gain_per_s=1.5,
+            decay_per_s=1.0,
+            # Headroom above activation so edges keep a reserve against
+            # YOLO bbox wobble — a cell heavily detected for ~2 s saturates
+            # at 3.0 and survives roughly 3 s of unbroken misses before
+            # falling below activation. Dry tracker stays at the default
+            # 1.0 ceiling for now since it isn't suffering edge erosion.
+            max_cell_value=3.0,
         )
         self.dry_tracker = FireTracker(
             origin_lat=self.map_origin_lat,
             origin_lon=self.map_origin_lon,
-            distance_threshold_m=6.0,
+            distance_threshold_m=2.5,
             ttl_s=4.0,
             min_hits=2,
+            merge_dilate_cells=0,
+            merge_overlap_min_cells=6,
         )
         self._fire_map_interval_s = 1.0
         self._last_fire_map_write = 0.0
         self._fire_snapshot = []
+        self._origin_command_path = os.path.join(self.paths.root_dir, "origin_command.json")
+        self._origin_command_seq = -1
+        # Clean any stale command from a previous session so a leftover file
+        # can't out-rank fresh clicks (the seq lives in the file, not memory).
+        try:
+            os.remove(self._origin_command_path)
+        except FileNotFoundError:
+            pass
 
         self.prediction_engine = PredictionEngine()
         self.prediction_horizons_min = (15.0, 30.0, 60.0)
@@ -470,41 +495,27 @@ class LustraApp:
             cv2.putText(top_block, line, (tx, text_y), font, scale, color, thickness)
             text_y += th + (8 if i == 0 else 7)
 
-        tracker_x0 = max(map_w + 2 * pad, right_w - 260)
-        tracker_y0 = min(text_y + 6, top_h - 24)
-        tracker_w = right_w - tracker_x0 - pad
-        tracker_h = max(60, top_h - tracker_y0 - pad)
-        cv2.rectangle(top_block, (tracker_x0, tracker_y0), (tracker_x0 + tracker_w, tracker_y0 + tracker_h), (90, 90, 90), 1)
-        cv2.putText(top_block, "Fire Tracker", (tracker_x0 + 8, tracker_y0 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 230, 255), 1)
-
-        line_y = tracker_y0 + 40
-        if not fire_snapshot:
-            cv2.putText(top_block, "No active fires", (tracker_x0 + 8, line_y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
-        else:
-            for entry in fire_snapshot[:6]:
-                track_id = entry.get("track_id")
-                hits = entry.get("hits")
-                conf = entry.get("confidence")
-                age = entry.get("age_s")
-                label = f"#{track_id} hits={hits} conf={conf:.2f} age={age:.1f}s"
-                cv2.putText(top_block, label, (tracker_x0 + 8, line_y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1)
-                line_y += 18
-                if line_y > tracker_y0 + tracker_h - 8:
-                    break
-
         depth_resized = cv2.resize(depth_panel, (right_w, bottom_h), interpolation=cv2.INTER_LINEAR)
         right_column = np.vstack([top_block, h_spacer, depth_resized])
 
         return np.hstack([debug_left, v_spacer, right_column])
 
     def compute_camera_footprint(self):
-        """Project the four image corners onto the ground plane.
+        """Project the four image corners onto the ground plane, clipped to
+        the detector's trusted horizon.
 
-        Returns (footprint_xy, reliability) where footprint_xy is a list of
-        (x, y) ground points in cyclic order (TL, TR, BR, BL) with any
-        unusable corners filtered out, and reliability is the fraction of
-        corners that resolved cleanly (0..1). Returns (None, 0.0) when fewer
-        than 3 corners are usable — caller should skip miss-tracking.
+        Returns (footprint_xy, reliability). The previous version dropped
+        corners whose rays hit the ground beyond ``4 × drone_height`` (≈72 m
+        at default altitude). That left the polygon technically inside the
+        camera's geometric view but well past the detector's reliable range
+        (~40 m), so ``mark_misses`` decayed cells where a fire could easily
+        exist but YOLO never had a chance to flag it.
+
+        Now each corner is clipped to a ``max_xy`` horizontal cap: corners
+        that would hit far ground are pulled in along their ray direction,
+        and corners whose rays point above the horizon are projected to the
+        same cap in the ray's XY direction. The resulting polygon stays
+        tight to the area where "no detection" actually means "no fire".
         """
         corners_img = [
             (0, 0),
@@ -514,23 +525,43 @@ class LustraApp:
         ]
         eye_pos = self.current_left_eye
         target_pos = self.current_left_target
-        # Cap usable range so near-horizon rays don't claim to see kilometers.
-        max_range = 4.0 * max(float(self.drone_height_m), 1.0)
-        valid_points: list = []
-        valid_count = 0
+        # Matches the bbox-derived ranges seen in real fire detections
+        # (~40 m at default 18 m altitude); the 45 m absolute cap prevents
+        # high-altitude flights from re-expanding the over-decay zone.
+        max_xy = min(2.5 * max(float(self.drone_height_m), 1.0), 45.0)
+        pts: list = []
+        natural = 0
         for (u, v) in corners_img:
             ray_cam = pixel_to_camera_ray(u, v, self.fx, self.fy, self.cx, self.cy)
             ray_world = camera_ray_to_world(ray_cam, eye_pos, target_pos, self.cam_up)
-            pt = intersect_ray_with_ground(eye_pos, ray_world, ground_z=0.0)
-            if pt is None:
+            gnd = intersect_ray_with_ground(eye_pos, ray_world, ground_z=0.0)
+            if gnd is not None:
+                dx = float(gnd[0] - eye_pos[0])
+                dy = float(gnd[1] - eye_pos[1])
+                xy_dist = math.sqrt(dx * dx + dy * dy)
+                if xy_dist <= max_xy:
+                    pts.append((float(gnd[0]), float(gnd[1])))
+                    natural += 1
+                    continue
+                scale = max_xy / xy_dist
+                pts.append((float(eye_pos[0]) + dx * scale, float(eye_pos[1]) + dy * scale))
                 continue
-            if float(np.linalg.norm(pt - eye_pos)) > max_range:
+            # Ray points to or above the horizon: anchor the corner at the
+            # cap along the ray's horizontal direction instead of dropping.
+            ray_xy_norm = math.sqrt(float(ray_world[0]) ** 2 + float(ray_world[1]) ** 2)
+            if ray_xy_norm < 1e-6:
                 continue
-            valid_points.append((float(pt[0]), float(pt[1])))
-            valid_count += 1
-        if valid_count < 3:
+            pts.append((
+                float(eye_pos[0]) + float(ray_world[0]) / ray_xy_norm * max_xy,
+                float(eye_pos[1]) + float(ray_world[1]) / ray_xy_norm * max_xy,
+            ))
+        if len(pts) < 3:
             return None, 0.0
-        return valid_points, valid_count / 4.0
+        # Natural ground hits inside the cap are full-weight; clamped
+        # corners (clipped or sky-projected) get half-weight because they
+        # represent the trust horizon, not measured ground.
+        reliability = (natural + (len(pts) - natural) * 0.5) / 4.0
+        return pts, reliability
 
     def project_bbox_corners_via_stereo(self, depth_m, x1, y1, x2, y2):
         corners_img = [
@@ -603,20 +634,55 @@ class LustraApp:
             return np.nan
         return float(np.median(np.array(ranges, dtype=np.float32)))
 
+    def _apply_origin_command(self) -> None:
+        """If serve_map.py has written a new /origin command, re-anchor the map.
+
+        The sim world (drone XY, fire sources, detector) is untouched — only
+        the lat/lon projection shifts, so every fire and the drone marker
+        teleport on the Leaflet map while the simulation continues normally.
+        """
+        try:
+            with open(self._origin_command_path, "r", encoding="utf-8") as f:
+                cmd = json.load(f)
+            seq = int(cmd.get("seq", -1))
+            if seq <= self._origin_command_seq:
+                return
+            lat = float(cmd["lat"])
+            lon = float(cmd["lon"])
+        except (FileNotFoundError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+            return
+
+        self._origin_command_seq = seq
+        self.map_origin_lat = lat
+        self.map_origin_lon = lon
+        # Trackers cache cos(lat) for meters-per-degree-lon — keep both in sync.
+        meters_per_deg_lon = 111_111.0 * max(0.1, math.cos(math.radians(lat)))
+        for tracker in (self.fire_tracker, self.dry_tracker):
+            tracker.origin_lat = lat
+            tracker.origin_lon = lon
+            tracker._meters_per_deg_lon = meters_per_deg_lon
+        # Force the next prediction tick to re-fetch weather/terrain at the
+        # new lat/lon instead of waiting for the 15 s interval to elapse,
+        # and drop the previous location's predicted polygons / weather so
+        # the GUI doesn't show stale data while the new tick is in flight.
+        self._last_prediction_at = 0.0
+        with self._prediction_lock:
+            self._latest_prediction_geojson = {"type": "FeatureCollection", "features": []}
+            self._latest_weather_block = None
+        print(f"[origin] relocated to {cmd.get('name', '?')} ({lat:.4f}, {lon:.4f})", flush=True)
+
     def update_fire_map(self, fire_polygons, dry_polygons, footprint_xy, frame_weight, timestamp_s):
+        self._apply_origin_command()
         self.fire_tracker.update(fire_polygons, timestamp_s)
         self.dry_tracker.update(dry_polygons, timestamp_s)
         fire_det_polys = [d["polygon_xy"] for d in fire_polygons if d.get("polygon_xy")]
         dry_det_polys = [d["polygon_xy"] for d in dry_polygons if d.get("polygon_xy")]
         self.fire_tracker.mark_misses(footprint_xy, frame_weight, timestamp_s, fire_det_polys)
         self.dry_tracker.mark_misses(footprint_xy, frame_weight, timestamp_s, dry_det_polys)
-        self._fire_snapshot = self.fire_tracker.get_active_tracks(timestamp_s, include_unconfirmed=True)
         if timestamp_s - self._last_fire_map_write < self._fire_map_interval_s:
             return
 
         drone_lon, drone_lat = self.fire_tracker.world_xy_to_lonlat((self.base_eye_pos[0], self.base_eye_pos[1]))
-        self.fire_map_config.center_lat = drone_lat
-        self.fire_map_config.center_lon = drone_lon
 
         fire_geojson = self.fire_tracker.to_geojson(timestamp_s)
         dry_geojson = self.dry_tracker.to_geojson(timestamp_s)
